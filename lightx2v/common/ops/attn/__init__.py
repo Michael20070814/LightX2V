@@ -1,3 +1,4 @@
+from .cute_dsl_vit_fmha import CuteDslViTFMHASm110Weight
 from .draft_attn import DraftAttnWeight
 from .flash_attn import FlashAttn2Weight, FlashAttn3Weight, FlashAttn4Weight, SparseFlashAttn4Weight
 from .general_sparse_attn import GeneralSparseAttnWeight
