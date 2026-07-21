@@ -72,6 +72,83 @@ def _attn_fwd(
 
 
 @triton.jit
+def _attn_fwd_split_k(
+    Q,
+    K,
+    V,
+    qk_scale: tl.constexpr,
+    topk: tl.constexpr,
+    LUT,
+    LSE,
+    OS,
+    L: tl.constexpr,
+    M_BLOCKS: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    SPARSE_BLOCK_N: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    idx_m = tl.program_id(0)
+    idx_bh = tl.program_id(1)
+
+    qkv_offset = idx_bh * L * D
+    lut_offset = (idx_bh * M_BLOCKS + idx_m) * topk
+    lse_offset = idx_bh * L
+    offs_m = idx_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+
+    Q_ptrs = Q + qkv_offset + offs_m[:, None] * D + offs_d[None, :]
+    K_ptrs = K + qkv_offset + offs_n[None, :] * D + offs_d[:, None]
+    V_ptrs = V + qkv_offset + offs_n[:, None] * D + offs_d[None, :]
+    OS_ptrs = OS + qkv_offset + offs_m[:, None] * D + offs_d[None, :]
+    LUT_ptr = LUT + lut_offset
+    LSE_ptrs = LSE + lse_offset + offs_m
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    o_s = tl.zeros([BLOCK_M, D], dtype=tl.float32)
+
+    q = tl.load(Q_ptrs, mask=offs_m[:, None] < L, other=0.0)
+    K_SUB_BLOCKS: tl.constexpr = SPARSE_BLOCK_N // BLOCK_N
+    # Flatten each selected sparse block so its K/V sub-blocks stay sequential.
+    for compute_block_idx in tl.range(
+        topk * K_SUB_BLOCKS,
+        loop_unroll_factor=1,
+        disallow_acc_multi_buffer=True,
+    ):
+        lut_idx = compute_block_idx // K_SUB_BLOCKS
+        sub_block_idx = compute_block_idx % K_SUB_BLOCKS
+        sparse_block_idx = tl.load(LUT_ptr + lut_idx).to(tl.int32)
+        token_start = sparse_block_idx * SPARSE_BLOCK_N + sub_block_idx * BLOCK_N
+        n_mask = offs_n < L - token_start
+
+        k = tl.load(K_ptrs + token_start * D, mask=n_mask[None, :], other=0.0)
+        qk = tl.dot(q, k) * (qk_scale * 1.4426950408889634)  # = 1 / ln(2)
+        qk = tl.where(n_mask[None, :], qk, float("-inf"))
+
+        local_m = tl.max(qk, 1)
+        new_m = tl.maximum(m_i, local_m)
+        qk = qk - new_m[:, None]
+
+        p = tl.math.exp2(qk)
+        l_ij = tl.sum(p, 1)
+        alpha = tl.math.exp2(m_i - new_m)
+        o_s = o_s * alpha[:, None]
+        l_i = l_i * alpha + l_ij
+        m_i = new_m
+
+        v = tl.load(V_ptrs + token_start * D, mask=n_mask[:, None], other=0.0)
+        o_s += tl.dot(p.to(v.dtype), v)
+
+    o_s = o_s / l_i[:, None]
+    tl.store(OS_ptrs, o_s.to(OS.type.element_ty), mask=offs_m[:, None] < L)
+
+    m_i += tl.math.log2(l_i)
+    tl.store(LSE_ptrs, m_i, mask=offs_m < L)
+
+
+@triton.jit
 def _attn_bwd_preprocess(
     OS,
     DOS,
@@ -244,7 +321,7 @@ def _attn_bwd_dkdv(
 
 class _attention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, k_block_id, lut, topk, BLOCK_M, BLOCK_N, qk_scale=None):
+    def forward(ctx, q, k, v, k_block_id, lut, topk, BLOCK_M, BLOCK_N, qk_scale=None, triton_forward_setting=None):
         assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
         assert k_block_id.is_contiguous() and lut.is_contiguous()
 
@@ -262,7 +339,40 @@ class _attention(torch.autograd.Function):
         lse = torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32)
 
         grid = (M_BLOCKS, B * H)
-        _attn_fwd[grid](q, k, v, qk_scale, topk, lut, lse, o_s, L, M_BLOCKS, D, BLOCK_M, BLOCK_N, num_warps=4 if q.shape[-1] == 64 else 8, num_stages=3)
+        if triton_forward_setting is None:
+            _attn_fwd[grid](q, k, v, qk_scale, topk, lut, lse, o_s, L, M_BLOCKS, D, BLOCK_M, BLOCK_N, num_warps=4 if q.shape[-1] == 64 else 8, num_stages=3)
+        else:
+            forward_block_m = triton_forward_setting.get("block_m", BLOCK_M)
+            forward_block_n = triton_forward_setting.get("block_n", BLOCK_N)
+            forward_num_warps = triton_forward_setting.get("num_warps", 4 if D == 64 else 8)
+            forward_num_stages = triton_forward_setting.get("num_stages", 3)
+
+            assert forward_block_m == BLOCK_M, "The forward compute M tile must match the sparse query block size"
+            assert forward_block_n < BLOCK_N and BLOCK_N % forward_block_n == 0, "The forward compute N tile must evenly split the sparse K block"
+            assert forward_block_n >= 16 and (forward_block_n & (forward_block_n - 1)) == 0, "The forward compute N tile must be a power of two of at least 16"
+            if lut.dtype != torch.int32:
+                raise TypeError("The split-K forward kernel requires an int32 LUT")
+            if max(q.numel(), k.numel(), v.numel(), lut.numel(), lse.numel()) > 1 << 31:
+                raise ValueError("The split-K forward kernel requires int32-addressable tensors")
+
+            _attn_fwd_split_k[grid](
+                q,
+                k,
+                v,
+                qk_scale,
+                topk,
+                lut,
+                lse,
+                o_s,
+                L,
+                M_BLOCKS,
+                D,
+                BLOCK_M,
+                BLOCK_N,
+                forward_block_n,
+                num_warps=forward_num_warps,
+                num_stages=forward_num_stages,
+            )
 
         ctx.save_for_backward(q, k, v, k_block_id, lut, lse, o_s)
         ctx.qk_scale = qk_scale
@@ -325,4 +435,4 @@ class _attention(torch.autograd.Function):
             num_stages=4 if q.shape[-1] == 64 else 5,
         )
 
-        return dq, dk, dv, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None

@@ -33,9 +33,11 @@ class SlaAttnWeight(AttnWeightTemplate):
     sparsity_ratio = 0.8
     operator = "triton"
     per_block_mean = False
+    triton_forward_setting = None
 
     def __init__(self):
         self.config = {}
+        self.triton_forward_setting = None if self.triton_forward_setting is None else dict(self.triton_forward_setting)
 
         self.arch = get_cuda_arch(torch.cuda.current_device())
         self.topk = 1 - self.sparsity_ratio
@@ -96,7 +98,10 @@ class SlaAttnWeight(AttnWeightTemplate):
 
         sparse_map, lut, real_topk = get_block_map(q, k, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
 
-        out = _attention.apply(q, k, v, sparse_map, lut, real_topk, self.BLKQ, self.BLKK)
+        if self.triton_forward_setting is not None:
+            lut = lut.to(torch.int32)
+
+        out = _attention.apply(q, k, v, sparse_map, lut, real_topk, self.BLKQ, self.BLKK, None, self.triton_forward_setting)
         out = out.transpose(1, 2).reshape(max_seqlen_q, -1)
 
         return out

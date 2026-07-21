@@ -65,7 +65,7 @@ class SlaTritonOperator:
         topk = int(mask.sum(dim=-1).max().item())
         lut = torch.topk(mask, topk, dim=-1, sorted=False).indices
 
-        out = _attention.apply(q, k, v, mask, lut, topk, self.q_block_size, self.k_block_size)
+        out = _attention.apply(q, k, v, mask, lut, topk, self.q_block_size, self.k_block_size, None, None)
         out = out.transpose(1, 2).reshape(max_seqlen_q, -1)
         return out
 

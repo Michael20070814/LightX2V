@@ -7,7 +7,13 @@
     "self_attn_1_type": "sla_attn",
     "sla_attn_setting": {
         "sparsity_ratio": 0.8,
-        "operator": "triton"
+        "operator": "triton",
+        "triton_forward_setting": {
+            "block_m": 64,
+            "block_n": 32,
+            "num_warps": 8,
+            "num_stages": 1
+        }
     },
     "cross_attn_1_type": "sage_attn2",
     "cross_attn_2_type": "sage_attn2",

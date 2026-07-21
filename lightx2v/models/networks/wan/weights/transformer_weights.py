@@ -371,6 +371,7 @@ class WanSelfAttention(WeightModule):
         # sla_attn setting
         if self.config["self_attn_1_type"] == "sla_attn":
             sla_config = self.config.get("sla_attn_setting", {})
+            attention_weights_cls.triton_forward_setting = sla_config.get("triton_forward_setting")
             if "sparsity_ratio" in sla_config:
                 attention_weights_cls.sparsity_ratio = sla_config["sparsity_ratio"]
             if "per_block_mean" in sla_config:
