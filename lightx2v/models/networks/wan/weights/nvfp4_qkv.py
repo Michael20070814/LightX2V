@@ -60,7 +60,9 @@ class WanNVFP4FusedQKV(WeightModule):
 
         self.weight = torch.cat(weights, dim=0).contiguous()
         self.weight_scale = torch.cat(weight_scales, dim=0).contiguous()
-        self.input_global_scale = reference_input_scale.contiguous()
+        self.input_global_scale = torch.tensor(
+            reference_input_scale.item(), dtype=torch.float32, device=reference_input_scale.device
+        )
         self.alpha_values = torch.stack([alpha.reshape([]) for alpha in alpha_values]).to(torch.float32)
         self.alpha = torch.cat(
             [alpha.expand(output_size) for alpha, output_size in zip(self.alpha_values, self.output_splits)],

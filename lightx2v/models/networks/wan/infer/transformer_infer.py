@@ -240,7 +240,8 @@ class WanTransformerInfer(WanMxfp8FuseMixin, BaseTransformerInfer):
             if norm1_quant is not None:
                 raise RuntimeError("NVFP4 fused QKV cannot consume an MXFP8-quantized activation")
             qkv = phase.self_attn_qkv.apply(norm1_out)
-            q, k, v = qkv.split(phase.self_attn_qkv.output_splits, dim=-1)
+            # Downstream norm/RoPE/attention kernels require row-contiguous Q/K/V.
+            q, k, v = (part.contiguous() for part in qkv.split(phase.self_attn_qkv.output_splits, dim=-1))
             q = phase.self_attn_norm_q.apply(q).view(s, n, d)
             k = phase.self_attn_norm_k.apply(k).view(s, n, d)
             v = v.view(s, n, d)
