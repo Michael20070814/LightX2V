@@ -43,6 +43,8 @@ class WanNVFP4FusedQKV(WeightModule):
             raise ValueError(f"Fused QKV requires identical input_global_scale values; got {values}")
 
         self.output_splits = tuple(weight.shape[0] for weight in weights)
+        if len(set(self.output_splits)) != 1:
+            raise ValueError(f"Batched fused QKV requires equal Q/K/V output sizes; got {self.output_splits}")
         if any(output_size % 128 != 0 for output_size in self.output_splits):
             raise ValueError(
                 "Fused QKV requires every projection output size to be divisible by 128 "
@@ -58,17 +60,14 @@ class WanNVFP4FusedQKV(WeightModule):
         if any(bias is None for bias in biases) and not all(bias is None for bias in biases):
             raise ValueError("Fused QKV requires either all three biases or no biases")
 
-        self.weight = torch.cat(weights, dim=0).contiguous()
-        self.weight_scale = torch.cat(weight_scales, dim=0).contiguous()
+        self.weight = torch.stack(weights, dim=0).contiguous()
+        self.weight_scale = torch.stack(weight_scales, dim=0).contiguous()
         self.input_global_scale = torch.tensor(
             reference_input_scale.item(), dtype=torch.float32, device=reference_input_scale.device
         )
         self.alpha_values = torch.stack([alpha.reshape([]) for alpha in alpha_values]).to(torch.float32)
-        self.alpha = torch.cat(
-            [alpha.expand(output_size) for alpha, output_size in zip(self.alpha_values, self.output_splits)],
-            dim=0,
-        ).contiguous()
-        self.bias = None if all(bias is None for bias in biases) else torch.cat(biases, dim=0).contiguous()
+        self.alpha = self.alpha_values.contiguous()
+        self.bias = None if all(bias is None for bias in biases) else torch.stack(biases, dim=0).contiguous()
 
     def apply(self, input_tensor):
         input_quant, input_scale = scaled_nvfp4_quant(input_tensor, self.input_global_scale)
@@ -84,9 +83,9 @@ class WanNVFP4FusedQKV(WeightModule):
     def state_dict(self, destination=None):
         if destination is None:
             destination = {}
-        weight_parts = self.weight.split(self.output_splits, dim=0)
-        scale_parts = self.weight_scale.split(self.output_splits, dim=0)
-        bias_parts = (None,) * 3 if self.bias is None else self.bias.split(self.output_splits, dim=0)
+        weight_parts = self.weight.unbind(dim=0)
+        scale_parts = self.weight_scale.unbind(dim=0)
+        bias_parts = (None,) * 3 if self.bias is None else self.bias.unbind(dim=0)
         for index in range(3):
             destination[self.weight_names[index]] = weight_parts[index]
             destination[self.weight_scale_names[index]] = scale_parts[index]

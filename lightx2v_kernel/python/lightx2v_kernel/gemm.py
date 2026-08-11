@@ -9,8 +9,8 @@ def cutlass_scaled_nvfp4_mm(mat_a, mat_b, scales_a, scales_b, alpha, bias=None):
 
 
 def cutlass_scaled_nvfp4_qkv_mm(mat_a, mat_b, scales_a, scales_b, alpha, bias=None):
-    m, n = mat_a.shape[0], mat_b.shape[0]
-    out = torch.empty((m, n), dtype=torch.bfloat16, device=mat_a.device)
+    m, n = mat_a.shape[0], mat_b.shape[1]
+    out = torch.empty((m, 3, n), dtype=torch.bfloat16, device=mat_a.device)
     torch.ops.lightx2v_kernel.cutlass_scaled_nvfp4_qkv_mm_sm120.default(
         out,
         mat_a,
@@ -20,7 +20,7 @@ def cutlass_scaled_nvfp4_qkv_mm(mat_a, mat_b, scales_a, scales_b, alpha, bias=No
         alpha,
         bias,
     )
-    return out
+    return out.view(m, 3 * n)
 
 
 def cutlass_scaled_nvfp4_mm_split_n_stride(mat_a, mat_b, scales_a, scales_b, alpha, bias=None, split_n_parts=2):

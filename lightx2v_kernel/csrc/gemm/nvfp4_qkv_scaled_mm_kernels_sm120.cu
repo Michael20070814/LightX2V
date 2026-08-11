@@ -28,6 +28,10 @@
 
 using namespace cute;
 
+constexpr int kQkvBatchCount = 3;
+constexpr int kQkvSharedMemoryLimitBytes = 114 * 1024;
+
+template <bool HasBias>
 struct Fp4QkvGemmSm120 {
   using ElementA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
   using LayoutATag = cutlass::layout::RowMajor;
@@ -38,11 +42,11 @@ struct Fp4QkvGemmSm120 {
   static constexpr int AlignmentB = 32;
 
   using ElementD = cutlass::bfloat16_t;
-  using ElementC = cutlass::bfloat16_t;
+  using ElementC = void;
   using LayoutCTag = cutlass::layout::RowMajor;
   using LayoutDTag = cutlass::layout::RowMajor;
   static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
-  static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+  static constexpr int AlignmentC = 1;
 
   using ElementAccumulator = float;
 #if defined(LIGHTX2V_THOR_NVFP4_ONLY)
@@ -52,20 +56,32 @@ struct Fp4QkvGemmSm120 {
 #endif
   using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
 
-  using ThreadBlockShape = Shape<_128, _128, _128>;
+  using ThreadBlockShape = Shape<_128, _128, _256>;
   using ClusterShape = Shape<_1, _1, _1>;
+#if defined(LIGHTX2V_THOR_NVFP4_ONLY)
+  using EpilogueTile = Shape<_128, _32>;
+  using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized1Sm;
+#else
+  using EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto;
+  using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
+#endif
 
-  using EVTOp = cutlass::epilogue::fusion::PerColLinCombPerColBiasEltAct<
-      cutlass::epilogue::thread::Identity,
-      ElementD,
-      ElementAccumulator>;
+  using EVTOp = cute::conditional_t<
+      HasBias,
+      cutlass::epilogue::fusion::LinCombPerColBias<
+          ElementD,
+          ElementAccumulator,
+          ElementD,
+          ElementC,
+          ElementAccumulator>,
+      cutlass::epilogue::fusion::ScaledAcc<ElementD, ElementAccumulator, ElementAccumulator>>;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag,
       OperatorClass,
       ThreadBlockShape,
       ClusterShape,
-      cutlass::epilogue::collective::EpilogueTileAuto,
+      EpilogueTile,
       ElementAccumulator,
       ElementAccumulator,
       ElementC,
@@ -74,7 +90,7 @@ struct Fp4QkvGemmSm120 {
       ElementD,
       LayoutDTag,
       AlignmentD,
-      cutlass::epilogue::collective::EpilogueScheduleAuto,
+      EpilogueSchedule,
       EVTOp>::CollectiveOp;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
@@ -89,16 +105,24 @@ struct Fp4QkvGemmSm120 {
       ElementAccumulator,
       ThreadBlockShape,
       ClusterShape,
-      cutlass::gemm::collective::StageCountAutoCarveout<
-          static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      cutlass::gemm::collective::StageCount<2>,
       cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
 
-  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+  using GemmKernelBase = cutlass::gemm::kernel::GemmUniversal<
       Shape<int, int, int, int>,
       CollectiveMainloop,
       CollectiveEpilogue,
       void>;
+
+  struct GemmKernel : GemmKernelBase {
+    static constexpr uint32_t MinBlocksPerMultiprocessor = 2;
+  };
+
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+  static_assert(
+      GemmKernel::SharedStorageSize <= kQkvSharedMemoryLimitBytes,
+      "Fused QKV dynamic shared memory exceeds the 2 CTA/SM budget");
 
   using StrideA = typename Gemm::GemmKernel::StrideA;
   using LayoutSFA = typename Gemm::GemmKernel::CollectiveMainloop::LayoutSFA;
@@ -108,7 +132,8 @@ struct Fp4QkvGemmSm120 {
   using StrideD = typename Gemm::GemmKernel::StrideD;
 };
 
-typename Fp4QkvGemmSm120::Gemm::Arguments make_fp4_qkv_gemm_arguments(
+template <bool HasBias>
+typename Fp4QkvGemmSm120<HasBias>::Gemm::Arguments make_fp4_qkv_gemm_arguments(
     at::Tensor& D,
     at::Tensor const& A,
     at::Tensor const& B,
@@ -119,25 +144,39 @@ typename Fp4QkvGemmSm120::Gemm::Arguments make_fp4_qkv_gemm_arguments(
     int64_t M,
     int64_t N,
     int64_t K) {
+  using KernelConfig = Fp4QkvGemmSm120<HasBias>;
   using Sm1xxBlkScaledConfig =
-      typename Fp4QkvGemmSm120::Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+      typename KernelConfig::Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 
   int m = static_cast<int>(M);
   int n = static_cast<int>(N);
   int k = static_cast<int>(K);
-  auto stride_A = cutlass::make_cute_packed_stride(Fp4QkvGemmSm120::StrideA{}, {m, k, 1});
-  auto stride_B = cutlass::make_cute_packed_stride(Fp4QkvGemmSm120::StrideB{}, {n, k, 1});
-  auto stride_D = cutlass::make_cute_packed_stride(Fp4QkvGemmSm120::StrideD{}, {m, n, 1});
-  auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
-  auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
+  auto problem_shape = cute::make_shape(m, n, k, kQkvBatchCount);
+  auto stride_A = cutlass::make_cute_packed_stride(
+      typename KernelConfig::StrideA{}, cute::make_shape(m, k, kQkvBatchCount));
+  auto stride_B = cutlass::make_cute_packed_stride(
+      typename KernelConfig::StrideB{}, cute::make_shape(n, k, kQkvBatchCount));
+  auto stride_D = cutlass::make_cute_packed_stride(
+      typename KernelConfig::StrideD{}, cute::make_shape(m, n, kQkvBatchCount));
 
-  typename Fp4QkvGemmSm120::Gemm::Arguments arguments{
+  // Q, K, and V share the same activation and activation scale-factor storage.
+  cute::get<2>(stride_A) = 0;
+  auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(problem_shape);
+  cute::get<1>(cute::get<2>(layout_SFA.stride())) = 0;
+
+  auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(problem_shape);
+
+  // Interleave Q/K/V within each output row so D is contiguous when viewed as [M, 3N].
+  cute::get<0>(stride_D) = static_cast<int64_t>(kQkvBatchCount) * n;
+  cute::get<2>(stride_D) = static_cast<int64_t>(n);
+
+  typename KernelConfig::Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kGemm,
-      {m, n, k, 1},
+      problem_shape,
       {
-          static_cast<Fp4QkvGemmSm120::Gemm::ElementA const*>(A.data_ptr()),
+          static_cast<typename KernelConfig::Gemm::ElementA const*>(A.data_ptr()),
           stride_A,
-          static_cast<Fp4QkvGemmSm120::Gemm::ElementB const*>(B.data_ptr()),
+          static_cast<typename KernelConfig::Gemm::ElementB const*>(B.data_ptr()),
           stride_B,
           static_cast<cutlass::float_ue4m3_t const*>(A_sf.data_ptr()),
           layout_SFA,
@@ -146,25 +185,27 @@ typename Fp4QkvGemmSm120::Gemm::Arguments make_fp4_qkv_gemm_arguments(
       },
       {
           {},
-          static_cast<Fp4QkvGemmSm120::Gemm::ElementC const*>(D.data_ptr()),
-          stride_D,
-          static_cast<Fp4QkvGemmSm120::Gemm::ElementD*>(D.data_ptr()),
+          nullptr,
+          typename KernelConfig::StrideC{},
+          static_cast<typename KernelConfig::Gemm::ElementD*>(D.data_ptr()),
           stride_D,
       },
   };
 
   auto& fusion_args = arguments.epilogue.thread;
   fusion_args.alpha_ptr = static_cast<float const*>(alpha.data_ptr());
-  fusion_args.dAlpha = {_0{}, true, 0};
-  fusion_args.beta = 0.0f;
-  fusion_args.dBeta = {_0{}, false, 0};
-  if (bias) {
+  fusion_args.dAlpha = {_0{}, _0{}, 1};
+  if constexpr (HasBias) {
+    TORCH_INTERNAL_ASSERT(bias.has_value());
+    fusion_args.beta = 0.0f;
     fusion_args.bias_ptr =
-        static_cast<Fp4QkvGemmSm120::Gemm::ElementC const*>(bias->data_ptr());
+        static_cast<typename KernelConfig::Gemm::ElementD const*>(bias->data_ptr());
+    fusion_args.dBias = {_0{}, _1{}, static_cast<int64_t>(n)};
   }
   return arguments;
 }
 
+template <bool HasBias>
 void run_fp4_qkv_gemm_sm120(
     at::Tensor& D,
     at::Tensor const& A,
@@ -177,13 +218,45 @@ void run_fp4_qkv_gemm_sm120(
     int64_t n,
     int64_t k,
     cudaStream_t stream) {
-  typename Fp4QkvGemmSm120::Gemm gemm;
-  auto arguments = make_fp4_qkv_gemm_arguments(D, A, B, A_sf, B_sf, alpha, bias, m, n, k);
-  size_t workspace_size = Fp4QkvGemmSm120::Gemm::get_workspace_size(arguments);
+  using KernelConfig = Fp4QkvGemmSm120<HasBias>;
+  typename KernelConfig::Gemm gemm;
+  auto arguments = make_fp4_qkv_gemm_arguments<HasBias>(D, A, B, A_sf, B_sf, alpha, bias, m, n, k);
+  size_t workspace_size = KernelConfig::Gemm::get_workspace_size(arguments);
   auto workspace = torch::empty(
       workspace_size,
       torch::TensorOptions().dtype(torch::kUInt8).device(A.device()));
 
+  TORCH_CHECK(
+      KernelConfig::Gemm::GemmKernel::SharedStorageSize <= kQkvSharedMemoryLimitBytes,
+      "Fused QKV dynamic shared memory is ",
+      KernelConfig::Gemm::GemmKernel::SharedStorageSize,
+      " bytes, exceeding the ",
+      kQkvSharedMemoryLimitBytes,
+      " byte 2 CTA/SM limit");
+  int max_shared_memory_per_sm = 0;
+  auto device_attribute_status = cudaDeviceGetAttribute(
+      &max_shared_memory_per_sm,
+      cudaDevAttrMaxSharedMemoryPerMultiprocessor,
+      A.get_device());
+  TORCH_CHECK(
+      device_attribute_status == cudaSuccess,
+      "Failed to query per-SM shared memory: ",
+      cudaGetErrorString(device_attribute_status));
+  TORCH_CHECK(
+      2 * KernelConfig::Gemm::GemmKernel::SharedStorageSize <= max_shared_memory_per_sm,
+      "Fused QKV needs ",
+      2 * KernelConfig::Gemm::GemmKernel::SharedStorageSize,
+      " bytes of shared memory for 2 CTA/SM, but the device provides ",
+      max_shared_memory_per_sm,
+      " bytes per SM");
+  auto carveout_status = cudaFuncSetAttribute(
+      cutlass::device_kernel<typename KernelConfig::Gemm::GemmKernel>,
+      cudaFuncAttributePreferredSharedMemoryCarveout,
+      100);
+  TORCH_CHECK(
+      carveout_status == cudaSuccess,
+      "Failed to select the 100% shared-memory carveout: ",
+      cudaGetErrorString(carveout_status));
   CUTLASS_CHECK(gemm.can_implement(arguments));
   CUTLASS_CHECK(gemm.initialize(arguments, workspace.data_ptr(), stream));
   CUTLASS_CHECK(gemm.run(arguments, workspace.data_ptr(), stream));
@@ -208,21 +281,21 @@ void cutlass_scaled_nvfp4_qkv_mm_sm120(
   CHECK_INPUT(D, at::ScalarType::BFloat16, "out");
 
   TORCH_CHECK(A.dim() == 2, "a must be a matrix");
-  TORCH_CHECK(B.dim() == 2, "b must be a matrix");
+  TORCH_CHECK(B.dim() == 3 && B.sizes()[0] == kQkvBatchCount, "b must have shape (3, N, K / 2)");
   TORCH_CHECK(
-      A.sizes()[1] == B.sizes()[1],
+      A.sizes()[1] == B.sizes()[2],
       "a and b shapes cannot be multiplied (",
       A.sizes()[0],
       "x",
       A.sizes()[1],
-      " and ",
-      B.sizes()[0],
-      "x",
+      " and 3x",
       B.sizes()[1],
+      "x",
+      B.sizes()[2],
       ")");
 
   auto const m = A.sizes()[0];
-  auto const n = B.sizes()[0];
+  auto const n = B.sizes()[1];
   auto const k = A.sizes()[1] * 2;
 
   TORCH_CHECK(A.get_device() == B.get_device(), "a and b must be on the same CUDA device");
@@ -230,14 +303,24 @@ void cutlass_scaled_nvfp4_qkv_mm_sm120(
   TORCH_CHECK(A.get_device() == B_sf.get_device(), "a and scale_b must be on the same CUDA device");
   TORCH_CHECK(A.get_device() == alpha.get_device(), "a and alpha must be on the same CUDA device");
   TORCH_CHECK(A.get_device() == D.get_device(), "a and out must be on the same CUDA device");
-  TORCH_CHECK(alpha.numel() == n, "alpha must contain one value per output column (", n, ")");
+  TORCH_CHECK(alpha.sizes() == torch::IntArrayRef({kQkvBatchCount}), "alpha must have shape (3,)");
   if (bias) {
     auto const& bias_tensor = *bias;
     CHECK_INPUT(bias_tensor, at::ScalarType::BFloat16, "bias");
     TORCH_CHECK(A.get_device() == bias_tensor.get_device(), "a and bias must be on the same CUDA device");
-    TORCH_CHECK(bias_tensor.numel() == n, "bias must contain one value per output column (", n, ")");
+    TORCH_CHECK(
+        bias_tensor.sizes() == torch::IntArrayRef({kQkvBatchCount, n}),
+        "bias must have shape (3, ",
+        n,
+        ")");
   }
-  TORCH_CHECK(D.sizes() == torch::IntArrayRef({m, n}), "out must have shape (", m, ", ", n, ")");
+  TORCH_CHECK(
+      D.sizes() == torch::IntArrayRef({m, kQkvBatchCount, n}),
+      "out must have shape (",
+      m,
+      ", 3, ",
+      n,
+      ")");
 
   constexpr int alignment = 32;
   TORCH_CHECK(k % alignment == 0, "Expected k to be divisible by ", alignment);
@@ -256,8 +339,8 @@ void cutlass_scaled_nvfp4_qkv_mm_sm120(
       rounded_k,
       ")");
   TORCH_CHECK(
-      B_sf.sizes() == torch::IntArrayRef({rounded_n, rounded_k}),
-      "scale_b must have shape (",
+      B_sf.sizes() == torch::IntArrayRef({kQkvBatchCount, rounded_n, rounded_k}),
+      "scale_b must have shape (3, ",
       rounded_n,
       ", ",
       rounded_k,
@@ -265,5 +348,9 @@ void cutlass_scaled_nvfp4_qkv_mm_sm120(
 
   at::cuda::CUDAGuard device_guard{A.device()};
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.get_device());
-  run_fp4_qkv_gemm_sm120(D, A, B, A_sf, B_sf, alpha, bias, m, n, k, stream);
+  if (bias) {
+    run_fp4_qkv_gemm_sm120<true>(D, A, B, A_sf, B_sf, alpha, bias, m, n, k, stream);
+  } else {
+    run_fp4_qkv_gemm_sm120<false>(D, A, B, A_sf, B_sf, alpha, bias, m, n, k, stream);
+  }
 }

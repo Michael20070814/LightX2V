@@ -16,7 +16,7 @@ FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 @torch.inference_mode()
 def test_qkv_fusion_matches_three_gemms(bias_enabled):
     m, k = 129, 256
-    output_sizes = (128, 256, 128)
+    output_sizes = (128, 128, 128)
     activation = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
     weights = [
         torch.randn((output_size, k), dtype=torch.bfloat16, device="cuda")
@@ -47,7 +47,7 @@ def test_qkv_fusion_matches_three_gemms(bias_enabled):
         quantized_weight, weight_scale = scaled_nvfp4_quant(weight, weight_global_scale)
         weight_fp4.append(quantized_weight)
         weight_scales.append(weight_scale)
-        alphas.append(alpha.expand(weight.shape[0]))
+        alphas.append(alpha)
         expected.append(
             cutlass_scaled_nvfp4_mm(
                 activation_fp4,
@@ -61,11 +61,11 @@ def test_qkv_fusion_matches_three_gemms(bias_enabled):
 
     actual = cutlass_scaled_nvfp4_qkv_mm(
         activation_fp4,
-        torch.cat(weight_fp4, dim=0),
+        torch.stack(weight_fp4, dim=0),
         activation_scale,
-        torch.cat(weight_scales, dim=0),
-        torch.cat(alphas, dim=0),
-        None if not bias_enabled else torch.cat(biases, dim=0),
+        torch.stack(weight_scales, dim=0),
+        torch.stack(alphas, dim=0),
+        None if not bias_enabled else torch.stack(biases, dim=0),
     )
 
     torch.testing.assert_close(

@@ -239,8 +239,57 @@ class DefaultRunner(BaseRunner):
                 with ProfilingContext4DebugL1("step_pre"):
                     self.model.scheduler.step_pre(step_index=step_index)
 
+                profile_last_infer = (
+                    os.getenv("LIGHTX2V_PROFILE_LAST_INFER", "0") == "1"
+                    and segment_idx == self.video_segment_num - 1
+                    and step_index == infer_steps - 1
+                )
+                torch_profile_last_infer = (
+                    os.getenv("LIGHTX2V_TORCH_PROFILER_LAST_INFER", "0") == "1"
+                    and segment_idx == self.video_segment_num - 1
+                    and step_index == infer_steps - 1
+                )
+                if profile_last_infer:
+                    torch.cuda.synchronize()
+                    torch.cuda.cudart().cudaProfilerStart()
+                    torch.cuda.nvtx.range_push("lightx2v_last_infer")
+                    logger.info("Started external profiler for the final infer")
+
                 with ProfilingContext4DebugL1("🚀 infer_main"):
-                    self.model.infer(self.inputs)
+                    try:
+                        if torch_profile_last_infer:
+                            torch_profile_gate = os.getenv("LIGHTX2V_TORCH_PROFILER_LAST_INFER_GATE")
+                            if torch_profile_gate:
+                                import time
+
+                                logger.info(f"Waiting for torch profiler gate: {torch_profile_gate}")
+                                while not os.path.exists(torch_profile_gate):
+                                    time.sleep(1)
+                                logger.info("Torch profiler gate released for the final infer")
+
+                            from lightx2v.utils.torch_trace_profiler import TorchTraceProfileContext
+
+                            torch_profile_dir = os.getenv(
+                                "LIGHTX2V_TORCH_PROFILER_LAST_INFER_DIR",
+                                os.path.join(os.getcwd(), "save_results", "torch_profile_last_infer"),
+                            )
+                            with TorchTraceProfileContext(
+                                "last_infer",
+                                profile_format="tensorboard",
+                                tb_dir=torch_profile_dir,
+                                wait=0,
+                                warmup=0,
+                                active=1,
+                            ) as torch_profile:
+                                torch_profile.run(self.model.infer, self.inputs)
+                        else:
+                            self.model.infer(self.inputs)
+                    finally:
+                        if profile_last_infer:
+                            torch.cuda.synchronize()
+                            torch.cuda.nvtx.range_pop()
+                            torch.cuda.cudart().cudaProfilerStop()
+                            logger.info("Stopped external profiler after the final infer")
 
                 with ProfilingContext4DebugL1("step_post"):
                     self.model.scheduler.step_post()
