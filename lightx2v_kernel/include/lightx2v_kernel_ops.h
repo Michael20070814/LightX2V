@@ -73,6 +73,15 @@ void cutlass_scaled_nvfp4_mm_sm120(
     torch::Tensor const& alpha,
     c10::optional<torch::Tensor> const& bias);
 
+void cutlass_scaled_nvfp4_qkv_mm_sm120(
+    torch::Tensor& D,
+    torch::Tensor const& A,
+    torch::Tensor const& B,
+    torch::Tensor const& A_sf,
+    torch::Tensor const& B_sf,
+    torch::Tensor const& alpha,
+    c10::optional<torch::Tensor> const& bias);
+
 void cutlass_scaled_nvfp4_mm_split_n_stride_sm120(
     torch::Tensor& D,
     torch::Tensor const& A,

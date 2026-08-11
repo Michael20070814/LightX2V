@@ -236,7 +236,15 @@ class WanTransformerInfer(WanMxfp8FuseMixin, BaseTransformerInfer):
             norm1_out = norm1_out.to(self.infer_dtype)
 
         s, n, d = *norm1_out.shape[:1], self.num_heads, self.head_dim
-        if norm1_quant is not None:
+        if hasattr(phase, "self_attn_qkv"):
+            if norm1_quant is not None:
+                raise RuntimeError("NVFP4 fused QKV cannot consume an MXFP8-quantized activation")
+            qkv = phase.self_attn_qkv.apply(norm1_out)
+            q, k, v = qkv.split(phase.self_attn_qkv.output_splits, dim=-1)
+            q = phase.self_attn_norm_q.apply(q).view(s, n, d)
+            k = phase.self_attn_norm_k.apply(k).view(s, n, d)
+            v = v.view(s, n, d)
+        elif norm1_quant is not None:
             q = phase.self_attn_norm_q.apply(self._mxfp8_apply_quantized(phase.self_attn_q, norm1_quant, norm1_scale)).view(s, n, d)
             k = phase.self_attn_norm_k.apply(self._mxfp8_apply_quantized(phase.self_attn_k, norm1_quant, norm1_scale)).view(s, n, d)
             v = self._mxfp8_apply_quantized(phase.self_attn_v, norm1_quant, norm1_scale).view(s, n, d)

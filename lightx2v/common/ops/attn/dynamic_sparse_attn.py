@@ -1,3 +1,5 @@
+import inspect
+
 import torch
 from loguru import logger
 
@@ -12,10 +14,13 @@ from .utils.sparge_util import block_map_incremental_lut_triton, block_map_ordin
 
 try:
     from flash_attn.cute import flash_attn_func as flash_attn_func_v4
-    from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
 except ImportError:
     logger.info("flash_attn.cute not found, please install flashattention4 first")
     flash_attn_func_v4 = None
+
+try:
+    from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+except ImportError:
     BlockSparseTensorsTorch = None
 
 try:
@@ -28,6 +33,32 @@ try:
     from magi_attention.functional import flex_flash_attn_func as magi_ffa_func
 except ImportError:
     magi_ffa_func = None
+
+
+def _detect_fa4_sparse_api():
+    if flash_attn_func_v4 is None:
+        return None
+    try:
+        parameters = inspect.signature(flash_attn_func_v4).parameters
+    except (TypeError, ValueError):
+        return None
+
+    if "block_sparse_tensors" in parameters:
+        return "block_sparse_tensors"
+
+    expanded_parameters = {
+        "mask_block_cnt",
+        "mask_block_idx",
+        "full_block_cnt",
+        "full_block_idx",
+        "block_size",
+    }
+    if expanded_parameters.issubset(parameters):
+        return "expanded"
+    return None
+
+
+_FA4_SPARSE_API = _detect_fa4_sparse_api()
 
 
 @ATTN_WEIGHT_REGISTER("dynamic_sparse_attn")
@@ -206,20 +237,28 @@ class DynamicSparseAttnWeight(AttnWeightTemplate):
         full_block_idx, full_block_cnt = block_map_ordinal_lut_triton(sparse_map)
         mask_block_cnt = torch.zeros_like(full_block_cnt)
         mask_block_idx = torch.zeros_like(full_block_idx)
-        block_sparse_tensors = BlockSparseTensorsTorch(
-            mask_block_cnt=mask_block_cnt,
-            mask_block_idx=mask_block_idx,
-            full_block_cnt=full_block_cnt,
-            full_block_idx=full_block_idx,
-            block_size=(self.BLKQ, self.BLKK),
-        )
-
-        out, _ = flash_attn_func_v4(
-            q=q,
-            k=k,
-            v=v,
-            block_sparse_tensors=block_sparse_tensors,
-        )
+        sparse_kwargs = {
+            "mask_block_cnt": mask_block_cnt,
+            "mask_block_idx": mask_block_idx,
+            "full_block_cnt": full_block_cnt,
+            "full_block_idx": full_block_idx,
+            "block_size": (self.BLKQ, self.BLKK),
+        }
+        if _FA4_SPARSE_API == "block_sparse_tensors":
+            if BlockSparseTensorsTorch is None:
+                raise RuntimeError("FA4 expects block_sparse_tensors, but BlockSparseTensorsTorch is unavailable")
+            out, _ = flash_attn_func_v4(
+                q=q,
+                k=k,
+                v=v,
+                block_sparse_tensors=BlockSparseTensorsTorch(**sparse_kwargs),
+            )
+        elif _FA4_SPARSE_API == "expanded":
+            out, _ = flash_attn_func_v4(q=q, k=k, v=v, **sparse_kwargs)
+        else:
+            raise RuntimeError(
+                "Unsupported FA4 sparse attention API: expected block_sparse_tensors or expanded sparse parameters"
+            )
         out = out.reshape(max_seqlen_q, -1)
         return out
 
