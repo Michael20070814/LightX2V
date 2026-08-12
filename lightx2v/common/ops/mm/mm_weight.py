@@ -36,6 +36,7 @@ try:
         cutlass_scaled_mxfp8_mm,
         cutlass_scaled_nvfp4_mm,
         cutlass_scaled_nvfp4_mm_split_n_stride,
+        cutlass_scaled_nvfp4_mm_split_n_stride_gelu,
         cutlass_scaled_nvfp4_mm_split_n_stride_residual_gate,
         scaled_mxfp4_quant,
         scaled_mxfp6_quant,
@@ -43,7 +44,7 @@ try:
         scaled_nvfp4_quant,
     )
 except ImportError:
-    scaled_nvfp4_quant, cutlass_scaled_nvfp4_mm, cutlass_scaled_nvfp4_mm_split_n_stride, cutlass_scaled_nvfp4_mm_split_n_stride_residual_gate, cublaslt_scaled_nvfp4_mm_bias = None, None, None, None, None
+    scaled_nvfp4_quant, cutlass_scaled_nvfp4_mm, cutlass_scaled_nvfp4_mm_split_n_stride, cutlass_scaled_nvfp4_mm_split_n_stride_gelu, cutlass_scaled_nvfp4_mm_split_n_stride_residual_gate, cublaslt_scaled_nvfp4_mm_bias = None, None, None, None, None, None
     scaled_mxfp4_quant, cutlass_scaled_mxfp4_mm = None, None
     scaled_mxfp6_quant, cutlass_scaled_mxfp6_mxfp8_mm = None, None
     scaled_mxfp8_quant, cutlass_scaled_mxfp8_mm = None, None
@@ -1402,6 +1403,18 @@ class MMWeightWnvfp4Anvfp4dynamicSplitNStrideWorkaround(MMWeightWnvfp4Anvfp4dyna
     def apply(self, input_tensor):
         input_tensor_quant, input_tensor_scale = self.act_quant_func(input_tensor)
         return cutlass_scaled_nvfp4_mm_split_n_stride(
+            input_tensor_quant,
+            self.weight,
+            input_tensor_scale,
+            self.weight_scale,
+            alpha=self.alpha,
+            bias=self.bias,
+            split_n_parts=self.split_n_parts,
+        )
+
+    def apply_gelu(self, input_tensor):
+        input_tensor_quant, input_tensor_scale = self.act_quant_func(input_tensor)
+        return cutlass_scaled_nvfp4_mm_split_n_stride_gelu(
             input_tensor_quant,
             self.weight,
             input_tensor_scale,

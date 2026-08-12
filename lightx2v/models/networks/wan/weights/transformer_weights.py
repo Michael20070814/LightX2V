@@ -830,6 +830,14 @@ class WanFFN(WeightModule):
         split_n_stride_enabled = config.get("nvfp4_ffn_split_n_stride_workaround", False)
         if not isinstance(split_n_stride_enabled, bool):
             raise TypeError("nvfp4_ffn_split_n_stride_workaround must be a boolean")
+        ffn0_gelu_fusion = config.get("nvfp4_ffn0_gelu_fusion", False)
+        if not isinstance(ffn0_gelu_fusion, bool):
+            raise TypeError("nvfp4_ffn0_gelu_fusion must be a boolean")
+        if ffn0_gelu_fusion:
+            if self.mm_type != "nvfp4":
+                raise ValueError("nvfp4_ffn0_gelu_fusion requires dit_quant_scheme='nvfp4'")
+            if not split_n_stride_enabled:
+                raise ValueError("nvfp4_ffn0_gelu_fusion requires nvfp4_ffn_split_n_stride_workaround=true")
         residual_gate_fusion = config.get("nvfp4_ffn2_residual_gate_fusion", False)
         if not isinstance(residual_gate_fusion, bool):
             raise TypeError("nvfp4_ffn2_residual_gate_fusion must be a boolean")

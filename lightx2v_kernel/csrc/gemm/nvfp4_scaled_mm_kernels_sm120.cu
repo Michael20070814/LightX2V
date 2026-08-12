@@ -31,6 +31,30 @@
 using namespace cute;
 
 namespace cutlass::epilogue::fusion {
+template <typename T>
+struct PyTorchTanhGelu {
+  CUTLASS_HOST_DEVICE
+  T operator()(T const& x) const {
+    T const beta = T(0.7978845608028654);
+    T const kappa = T(0.044715);
+    return T(0.5) * x * (T(1) + ::tanhf(beta * (x + kappa * x * x * x)));
+  }
+};
+
+template <typename T, int N>
+struct PyTorchTanhGelu<Array<T, N>> {
+  CUTLASS_HOST_DEVICE
+  Array<T, N> operator()(Array<T, N> const& input) const {
+    Array<T, N> output;
+    PyTorchTanhGelu<T> gelu;
+    CUTLASS_PRAGMA_UNROLL
+    for (int index = 0; index < N; ++index) {
+      output[index] = gelu(input[index]);
+    }
+    return output;
+  }
+};
+
 
 template<
   class ElementOutput_,
@@ -137,6 +161,96 @@ struct FusionCallbacks<
           {gate_ptr, ElementGate(0), dGate},
           {}
         },
+        {}
+      };
+    }
+  };
+
+  using Impl::Impl;
+};
+
+template<
+  class ElementOutput_,
+  class ElementCompute_,
+  class ElementBias_ = ElementOutput_,
+  class ElementSource_ = ElementOutput_,
+  class ElementScalar_ = ElementCompute_,
+  int AlignmentBias_ = 128 / cute::sizeof_bits_v<ElementBias_>,
+  FloatRoundStyle RoundStyle_ = FloatRoundStyle::round_to_nearest
+>
+struct LinCombPerColBiasBf16Gelu
+    : LinearCombination<ElementOutput_, ElementCompute_, ElementSource_, ElementScalar_, RoundStyle_> {
+  using ElementBias = ElementBias_;
+  static constexpr int AlignmentBias = AlignmentBias_;
+  static constexpr bool IsPerColBiasSupported = true;
+};
+
+template<
+  class CtaTileShapeMNK,
+  class ElementOutput,
+  class ElementCompute,
+  class ElementBias = ElementOutput,
+  class ElementSource = ElementOutput,
+  class ElementScalar = ElementCompute,
+  int AlignmentBias = 128 / sizeof_bits_v<ElementBias>,
+  FloatRoundStyle RoundStyle = FloatRoundStyle::round_to_nearest
+>
+using Sm90LinCombPerColBiasBf16Gelu =
+  // Match the unfused path's BF16 materialization before GELU.
+  Sm90EVT<Sm90Compute<PyTorchTanhGelu, ElementOutput, ElementCompute, RoundStyle>,
+    Sm90EVT<Sm90Compute<homogeneous_multiply_add, ElementOutput, ElementCompute, RoundStyle>,
+      Sm90ScalarBroadcast<ElementScalar, Stride<_0,_0,int64_t>>,
+      Sm90AccFetch,
+      Sm90RowBroadcast<0, CtaTileShapeMNK, ElementBias, ElementCompute, Stride<_0,_1,int64_t>, AlignmentBias>
+    >
+  >;
+
+template <
+  int StagesC,
+  int StagesD,
+  int FragmentSize,
+  bool ReuseSmemC,
+  bool DelayTmaStore,
+  class ElementOutput,
+  class ElementCompute,
+  class ElementBias,
+  class ElementSource,
+  class ElementScalar,
+  int AlignmentBias,
+  FloatRoundStyle RoundStyle,
+  class CtaTileShapeMNK,
+  class EpilogueTile
+>
+struct FusionCallbacks<
+    epilogue::Sm90TmaWarpSpecialized<StagesC, StagesD, FragmentSize, ReuseSmemC, DelayTmaStore>,
+    fusion::LinCombPerColBiasBf16Gelu<
+      ElementOutput, ElementCompute, ElementBias, ElementSource, ElementScalar,
+      AlignmentBias, RoundStyle>,
+    CtaTileShapeMNK,
+    EpilogueTile
+> : Sm90LinCombPerColBiasBf16Gelu<
+      CtaTileShapeMNK, ElementOutput, ElementCompute, ElementBias, ElementSource,
+      ElementScalar, AlignmentBias, RoundStyle> {
+  using Impl = Sm90LinCombPerColBiasBf16Gelu<
+    CtaTileShapeMNK, ElementOutput, ElementCompute, ElementBias, ElementSource,
+    ElementScalar, AlignmentBias, RoundStyle>;
+  using Operation = fusion::LinCombPerColBiasBf16Gelu<
+    ElementOutput, ElementCompute, ElementBias, ElementSource, ElementScalar,
+    AlignmentBias, RoundStyle>;
+
+  struct Arguments {
+    ElementScalar alpha = ElementScalar(1);
+    ElementScalar const* alpha_ptr = nullptr;
+    using StrideAlpha = Stride<_0,_0,int64_t>;
+    StrideAlpha dAlpha = {_0{}, _0{}, 0};
+
+    using StrideBias = Stride<_0,_1,int64_t>;
+    ElementBias const* bias_ptr = nullptr;
+    StrideBias dBias = {};
+
+    operator typename Impl::Arguments() const {
+      return {
+        {{{alpha}, {alpha_ptr}, {dAlpha}}, {}, {bias_ptr, ElementBias(0), dBias}, {}},
         {}
       };
     }
@@ -320,6 +434,67 @@ using Fp4GemmResidualGateSm120Wan22Ffn2 = Fp4GemmResidualGateSm120Config<
     cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100,
     cutlass::epilogue::TmaWarpSpecialized2SmNvf4>;
 
+struct Fp4GemmGeluSm120 {
+    using ElementA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+    using LayoutATag = cutlass::layout::RowMajor;
+    static constexpr int AlignmentA = 32;
+    using ElementB = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+    using LayoutBTag = cutlass::layout::ColumnMajor;
+    static constexpr int AlignmentB = 32;
+
+    using ElementD = cutlass::bfloat16_t;
+    using ElementC = cutlass::bfloat16_t;
+    using LayoutCTag = cutlass::layout::RowMajor;
+    using LayoutDTag = cutlass::layout::RowMajor;
+    static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+    static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+    using ElementAccumulator = float;
+#if defined(LIGHTX2V_THOR_NVFP4_ONLY)
+    using ArchTag = cutlass::arch::Sm100;
+#else
+    using ArchTag = cutlass::arch::Sm120;
+#endif
+    using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
+
+    using ThreadBlockShape = Shape<_128,_128,_128>;
+    using ClusterShape = Shape<_1,_1,_1>;
+
+    using EVTOp = cutlass::epilogue::fusion::LinCombPerColBiasBf16Gelu<
+        ElementD, ElementAccumulator, ElementD, ElementC, ElementAccumulator>;
+
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        ArchTag, OperatorClass,
+        ThreadBlockShape, ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator, ElementAccumulator,
+        ElementC, LayoutCTag, AlignmentC,
+        ElementD, LayoutDTag, AlignmentD,
+        cutlass::epilogue::collective::EpilogueScheduleAuto,
+        EVTOp
+    >::CollectiveOp;
+
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        ArchTag, OperatorClass,
+        ElementA, LayoutATag, AlignmentA,
+        ElementB, LayoutBTag, AlignmentB,
+        ElementAccumulator,
+        ThreadBlockShape, ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        cutlass::gemm::collective::KernelScheduleAuto
+    >::CollectiveOp;
+
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        Shape<int,int,int,int>, CollectiveMainloop, CollectiveEpilogue, void>;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using LayoutSFA = typename Gemm::GemmKernel::CollectiveMainloop::LayoutSFA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using LayoutSFB = typename Gemm::GemmKernel::CollectiveMainloop::LayoutSFB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+};
 
 // Populates a Gemm::Arguments structure from the given commandline options
 typename Fp4GemmSm120::Gemm::Arguments args_from_options_nvfp4_nvfp4(
@@ -528,6 +703,102 @@ void runGemmNvfp4SplitNStrideResidualGateSm120(
   auto arguments = args_from_options_nvfp4_split_n_stride_residual_gate<GemmConfig>(
       residual, A, B, A_sf, B_sf, alpha, bias, gate, m, n, k, split_n_parts);
   size_t workspace_size = GemmConfig::Gemm::get_workspace_size(arguments);
+  auto workspace = torch::empty(
+      workspace_size, torch::TensorOptions().dtype(torch::kUInt8).device(A.device()));
+
+  CUTLASS_CHECK(gemm.can_implement(arguments));
+  CUTLASS_CHECK(gemm.initialize(arguments, workspace.data_ptr(), stream));
+  CUTLASS_CHECK(gemm.run(arguments, workspace.data_ptr(), stream));
+}
+
+typename Fp4GemmGeluSm120::Gemm::Arguments
+args_from_options_nvfp4_split_n_stride_gelu(
+    at::Tensor& output,
+    at::Tensor const& A,
+    at::Tensor const& B,
+    at::Tensor const& A_sf,
+    at::Tensor const& B_sf,
+    at::Tensor const& alpha,
+    c10::optional<torch::Tensor> const& bias,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t split_n_parts) {
+  using Sm1xxBlkScaledConfig =
+      typename Fp4GemmGeluSm120::Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+
+  int m = static_cast<int>(M);
+  int n = static_cast<int>(N);
+  int k = static_cast<int>(K);
+  int batch_count = static_cast<int>(split_n_parts);
+  int shard_n = n / batch_count;
+
+  auto stride_A = cutlass::make_cute_packed_stride(
+      Fp4GemmGeluSm120::StrideA{}, {m, k, batch_count});
+  auto stride_B = cutlass::make_cute_packed_stride(
+      Fp4GemmGeluSm120::StrideB{}, {shard_n, k, batch_count});
+  auto stride_D = cutlass::make_cute_packed_stride(
+      Fp4GemmGeluSm120::StrideD{}, {m, shard_n, batch_count});
+  cute::get<2>(stride_A) = 0;
+  cute::get<0>(stride_D) = n;
+  cute::get<2>(stride_D) = shard_n;
+
+  auto problem_shape = cute::make_shape(m, shard_n, k, batch_count);
+  auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(problem_shape);
+  auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(problem_shape);
+  cute::get<2, 1>(cute::stride(layout_SFA)) = 0;
+
+  typename Fp4GemmGeluSm120::Gemm::Arguments arguments{
+    cutlass::gemm::GemmUniversalMode::kBatched,
+    problem_shape,
+    {
+      static_cast<Fp4GemmGeluSm120::Gemm::ElementA const*>(A.data_ptr()),
+      stride_A,
+      static_cast<Fp4GemmGeluSm120::Gemm::ElementB const*>(B.data_ptr()),
+      stride_B,
+      static_cast<cutlass::float_ue4m3_t const*>(A_sf.data_ptr()),
+      layout_SFA,
+      static_cast<cutlass::float_ue4m3_t const*>(B_sf.data_ptr()),
+      layout_SFB
+    },
+    {
+      {},
+      static_cast<Fp4GemmGeluSm120::ElementC const*>(output.data_ptr()),
+      stride_D,
+      static_cast<Fp4GemmGeluSm120::ElementD*>(output.data_ptr()),
+      stride_D
+    }
+  };
+
+  auto& fusion_args = arguments.epilogue.thread;
+  fusion_args.alpha_ptr = static_cast<float const*>(alpha.data_ptr());
+  if (bias) {
+    fusion_args.bias_ptr = static_cast<Fp4GemmGeluSm120::ElementD const*>(bias->data_ptr());
+    using StrideBias = Stride<cutlass::_0, cutlass::_1, int64_t>;
+    auto bias_stride = StrideBias{};
+    cute::get<2>(bias_stride) = shard_n;
+    fusion_args.dBias = bias_stride;
+  }
+  return arguments;
+}
+
+void runGemmNvfp4SplitNStrideGeluSm120(
+    at::Tensor& output,
+    at::Tensor const& A,
+    at::Tensor const& B,
+    at::Tensor const& A_sf,
+    at::Tensor const& B_sf,
+    at::Tensor const& alpha,
+    c10::optional<torch::Tensor> const& bias,
+    int64_t m,
+    int64_t n,
+    int64_t k,
+    int64_t split_n_parts,
+    cudaStream_t stream) {
+  typename Fp4GemmGeluSm120::Gemm gemm;
+  auto arguments = args_from_options_nvfp4_split_n_stride_gelu(
+      output, A, B, A_sf, B_sf, alpha, bias, m, n, k, split_n_parts);
+  size_t workspace_size = Fp4GemmGeluSm120::Gemm::get_workspace_size(arguments);
   auto workspace = torch::empty(
       workspace_size, torch::TensorOptions().dtype(torch::kUInt8).device(A.device()));
 
@@ -928,6 +1199,26 @@ void cutlass_scaled_nvfp4_mm_split_n_stride_sm120(
     runGemmNvfp4SplitNStrideSm120<Fp4GemmSm120>(
         D, A, B, A_sf, B_sf, alpha, bias, m, n, k, split_n_parts, stream);
   }
+}
+
+void cutlass_scaled_nvfp4_mm_split_n_stride_gelu_sm120(
+    torch::Tensor& D,
+    torch::Tensor const& A,
+    torch::Tensor const& B,
+    torch::Tensor const& A_sf,
+    torch::Tensor const& B_sf,
+    torch::Tensor const& alpha,
+    c10::optional<torch::Tensor> const& bias,
+    int64_t split_n_parts) {
+  check_nvfp4_split_n_stride_inputs(D, A, B, A_sf, B_sf, alpha, bias, split_n_parts);
+
+  auto const m = A.sizes()[0];
+  auto const n = B.sizes()[0];
+  auto const k = A.sizes()[1] * 2;
+  at::cuda::CUDAGuard device_guard{(char)A.get_device()};
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.get_device());
+  runGemmNvfp4SplitNStrideGeluSm120(
+      D, A, B, A_sf, B_sf, alpha, bias, m, n, k, split_n_parts, stream);
 }
 
 void cutlass_scaled_nvfp4_mm_split_n_stride_residual_gate_sm120(
