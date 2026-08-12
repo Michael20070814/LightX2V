@@ -73,14 +73,24 @@ void cutlass_scaled_nvfp4_mm_sm120(
     torch::Tensor const& alpha,
     c10::optional<torch::Tensor> const& bias);
 
-void cutlass_scaled_nvfp4_qkv_mm_sm120(
-    torch::Tensor& D,
-    torch::Tensor const& A,
-    torch::Tensor const& B,
-    torch::Tensor const& A_sf,
-    torch::Tensor const& B_sf,
+void cublaslt_scaled_nvfp4_mm_bias_sm120(
+    torch::Tensor& output,
+    torch::Tensor const& activation,
+    torch::Tensor const& weight,
+    torch::Tensor const& activation_scale,
+    torch::Tensor const& weight_scale,
     torch::Tensor const& alpha,
-    c10::optional<torch::Tensor> const& bias);
+    torch::Tensor const& bias,
+    int64_t algorithm_index);
+
+int64_t cublaslt_scaled_nvfp4_mm_bias_algo_count_sm120(
+    torch::Tensor const& output,
+    torch::Tensor const& activation,
+    torch::Tensor const& weight,
+    torch::Tensor const& activation_scale,
+    torch::Tensor const& weight_scale,
+    torch::Tensor const& alpha,
+    torch::Tensor const& bias);
 
 void cutlass_scaled_nvfp4_mm_split_n_stride_sm120(
     torch::Tensor& D,

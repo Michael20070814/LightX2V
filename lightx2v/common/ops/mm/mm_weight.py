@@ -30,6 +30,7 @@ from lightx2v_platform.base.global_var import AI_DEVICE
 
 try:
     from lightx2v_kernel.gemm import (
+        cublaslt_scaled_nvfp4_mm_bias,
         cutlass_scaled_mxfp4_mm,
         cutlass_scaled_mxfp6_mxfp8_mm,
         cutlass_scaled_mxfp8_mm,
@@ -41,7 +42,7 @@ try:
         scaled_nvfp4_quant,
     )
 except ImportError:
-    scaled_nvfp4_quant, cutlass_scaled_nvfp4_mm, cutlass_scaled_nvfp4_mm_split_n_stride = None, None, None
+    scaled_nvfp4_quant, cutlass_scaled_nvfp4_mm, cutlass_scaled_nvfp4_mm_split_n_stride, cublaslt_scaled_nvfp4_mm_bias = None, None, None, None
     scaled_mxfp4_quant, cutlass_scaled_mxfp4_mm = None, None
     scaled_mxfp6_quant, cutlass_scaled_mxfp6_mxfp8_mm = None, None
     scaled_mxfp8_quant, cutlass_scaled_mxfp8_mm = None, None
@@ -1250,6 +1251,29 @@ class MMWeightWnvfp4Anvfp4dynamic(MMWeightQuantTemplate):
             bias=self.bias,
         )
         return output_tensor
+
+    def apply_quantized(self, input_tensor_quant, input_tensor_scale):
+        return cutlass_scaled_nvfp4_mm(
+            input_tensor_quant,
+            self.weight,
+            input_tensor_scale,
+            self.weight_scale,
+            alpha=self.alpha,
+            bias=self.bias,
+        )
+
+    def apply_quantized_cublaslt(
+        self, input_tensor_quant, input_tensor_scale, algorithm_index=-1
+    ):
+        return cublaslt_scaled_nvfp4_mm_bias(
+            input_tensor_quant,
+            self.weight,
+            input_tensor_scale,
+            self.weight_scale,
+            alpha=self.alpha,
+            bias=self.bias,
+            algorithm_index=algorithm_index,
+        )
 
     def to_cuda(self, non_blocking=False):
         self.weight = self.pin_weight.to(AI_DEVICE, non_blocking=non_blocking)

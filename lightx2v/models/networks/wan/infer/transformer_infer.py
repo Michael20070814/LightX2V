@@ -236,15 +236,26 @@ class WanTransformerInfer(WanMxfp8FuseMixin, BaseTransformerInfer):
             norm1_out = norm1_out.to(self.infer_dtype)
 
         s, n, d = *norm1_out.shape[:1], self.num_heads, self.head_dim
-        if hasattr(phase, "self_attn_qkv"):
-            if norm1_quant is not None:
-                raise RuntimeError("NVFP4 fused QKV cannot consume an MXFP8-quantized activation")
-            qkv = phase.self_attn_qkv.apply(norm1_out)
-            # Downstream norm/RoPE/attention kernels require row-contiguous Q/K/V.
-            q, k, v = (part.contiguous() for part in qkv.split(phase.self_attn_qkv.output_splits, dim=-1))
-            q = phase.self_attn_norm_q.apply(q).view(s, n, d)
-            k = phase.self_attn_norm_k.apply(k).view(s, n, d)
-            v = v.view(s, n, d)
+        if self.config.get("nvfp4_qkv_cublaslt", False):
+            q_proj = phase.self_attn_q
+            k_proj = phase.self_attn_k
+            v_proj = phase.self_attn_v
+            if not getattr(phase, "_nvfp4_qkv_cublaslt_scale_checked", False):
+                reference_scale = q_proj.input_global_scale
+                if not torch.equal(reference_scale, k_proj.input_global_scale) or not torch.equal(
+                    reference_scale, v_proj.input_global_scale
+                ):
+                    raise ValueError("nvfp4_qkv_cublaslt requires identical Q/K/V input_global_scale values")
+                phase._nvfp4_qkv_cublaslt_scale_checked = True
+            qkv_quant, qkv_scale = q_proj.act_quant_func(norm1_out)
+            algorithm_index = self.config.get("nvfp4_qkv_cublaslt_algorithm", -1)
+            q = phase.self_attn_norm_q.apply(
+                q_proj.apply_quantized_cublaslt(qkv_quant, qkv_scale, algorithm_index)
+            ).view(s, n, d)
+            k = phase.self_attn_norm_k.apply(
+                k_proj.apply_quantized_cublaslt(qkv_quant, qkv_scale, algorithm_index)
+            ).view(s, n, d)
+            v = v_proj.apply_quantized_cublaslt(qkv_quant, qkv_scale, algorithm_index).view(s, n, d)
         elif norm1_quant is not None:
             q = phase.self_attn_norm_q.apply(self._mxfp8_apply_quantized(phase.self_attn_q, norm1_quant, norm1_scale)).view(s, n, d)
             k = phase.self_attn_norm_k.apply(self._mxfp8_apply_quantized(phase.self_attn_k, norm1_quant, norm1_scale)).view(s, n, d)

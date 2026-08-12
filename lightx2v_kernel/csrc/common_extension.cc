@@ -11,9 +11,19 @@ TORCH_LIBRARY_FRAGMENT(lightx2v_kernel, m) {
       "alpha, Tensor? bias) -> ()");
   m.impl("cutlass_scaled_nvfp4_mm_sm120", torch::kCUDA, &cutlass_scaled_nvfp4_mm_sm120);
   m.def(
-      "cutlass_scaled_nvfp4_qkv_mm_sm120(Tensor! out, Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, "
-      "Tensor alpha, Tensor? bias) -> ()");
-  m.impl("cutlass_scaled_nvfp4_qkv_mm_sm120", torch::kCUDA, &cutlass_scaled_nvfp4_qkv_mm_sm120);
+      "cublaslt_scaled_nvfp4_mm_bias_sm120(Tensor! out, Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, "
+      "Tensor alpha, Tensor bias, int algorithm_index) -> ()");
+  m.impl(
+      "cublaslt_scaled_nvfp4_mm_bias_sm120",
+      torch::kCUDA,
+      &cublaslt_scaled_nvfp4_mm_bias_sm120);
+  m.def(
+      "cublaslt_scaled_nvfp4_mm_bias_algo_count_sm120(Tensor out, Tensor mat_a, Tensor mat_b, Tensor scales_a, "
+      "Tensor scales_b, Tensor alpha, Tensor bias) -> int");
+  m.impl(
+      "cublaslt_scaled_nvfp4_mm_bias_algo_count_sm120",
+      torch::kCUDA,
+      &cublaslt_scaled_nvfp4_mm_bias_algo_count_sm120);
 
   m.def(
       "cutlass_scaled_nvfp4_mm_split_n_stride_sm120(Tensor! out, Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor "
