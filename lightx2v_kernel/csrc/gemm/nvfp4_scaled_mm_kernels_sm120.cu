@@ -148,7 +148,12 @@ struct FusionCallbacks<
 }  // namespace cutlass::epilogue::fusion
 
 
-struct Fp4GemmSm120 {
+template <
+    class ThreadBlockShape_,
+    class ClusterShape_,
+    class MainloopSchedule_,
+    class EpilogueSchedule_>
+struct Fp4GemmSm120Config {
     /////////////////////////////////////////////////////////////////////////////////////////////////
     /// GEMM kernel configurations
     /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -180,8 +185,8 @@ struct Fp4GemmSm120 {
     using OperatorClass       = cutlass::arch::OpClassBlockScaledTensorOp;      // Operator class tag
 
     // Kernel Perf config
-    using ThreadBlockShape    = Shape<_128,_128,_128>;                          // Threadblock's tile size
-    using ClusterShape        = Shape<_1,_1,_1>;                                // Shape of the threadblocks in a cluster
+    using ThreadBlockShape    = ThreadBlockShape_;
+    using ClusterShape        = ClusterShape_;
 
     // use per-column bias, i.e. every column has different bias
     using EVTOp = cutlass::epilogue::fusion::LinCombPerColBias<ElementD, ElementAccumulator>;
@@ -193,7 +198,7 @@ struct Fp4GemmSm120 {
         ElementAccumulator, ElementAccumulator,
         ElementC, LayoutCTag, AlignmentC,
         ElementD, LayoutDTag, AlignmentD,
-        cutlass::epilogue::collective::EpilogueScheduleAuto,                      // Epilogue schedule policy
+        EpilogueSchedule_,
         EVTOp
     >::CollectiveOp;
 
@@ -204,7 +209,7 @@ struct Fp4GemmSm120 {
         ElementAccumulator,
         ThreadBlockShape, ClusterShape,
         cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-        cutlass::gemm::collective::KernelScheduleAuto                             // Kernel schedule policy. Auto defaults to cooperative kernel schedule
+        MainloopSchedule_
     >::CollectiveOp;
 
     using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
@@ -228,7 +233,22 @@ struct Fp4GemmSm120 {
     using LayoutD   = decltype(cute::make_layout(make_shape(0,0,0), StrideD{}));
 };
 
-struct Fp4GemmResidualGateSm120 {
+using Fp4GemmSm120 = Fp4GemmSm120Config<
+    Shape<_128,_128,_128>, Shape<_1,_1,_1>,
+    cutlass::gemm::collective::KernelScheduleAuto,
+    cutlass::epilogue::collective::EpilogueScheduleAuto>;
+
+using Fp4GemmSm120Wan22Ffn2 = Fp4GemmSm120Config<
+    Shape<_256,_256,_256>, Shape<_2,_1,_1>,
+    cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100,
+    cutlass::epilogue::TmaWarpSpecialized2SmNvf4>;
+
+template <
+    class ThreadBlockShape_,
+    class ClusterShape_,
+    class MainloopSchedule_,
+    class EpilogueSchedule_>
+struct Fp4GemmResidualGateSm120Config {
     using ElementA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
     using LayoutATag = cutlass::layout::RowMajor;
     static constexpr int AlignmentA = 32;
@@ -250,8 +270,8 @@ struct Fp4GemmResidualGateSm120 {
 #endif
     using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
 
-    using ThreadBlockShape = Shape<_128,_128,_128>;
-    using ClusterShape = Shape<_1,_1,_1>;
+    using ThreadBlockShape = ThreadBlockShape_;
+    using ClusterShape = ClusterShape_;
 
     using EVTOp = cutlass::epilogue::fusion::LinCombPerColBiasBf16GateResidual<
         ElementD, ElementAccumulator, ElementD, ElementD, ElementC, ElementAccumulator>;
@@ -263,7 +283,7 @@ struct Fp4GemmResidualGateSm120 {
         ElementAccumulator, ElementAccumulator,
         ElementC, LayoutCTag, AlignmentC,
         ElementD, LayoutDTag, AlignmentD,
-        cutlass::epilogue::collective::EpilogueScheduleAuto,
+        EpilogueSchedule_,
         EVTOp
     >::CollectiveOp;
 
@@ -275,7 +295,7 @@ struct Fp4GemmResidualGateSm120 {
         ThreadBlockShape, ClusterShape,
         cutlass::gemm::collective::StageCountAutoCarveout<
             static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-        cutlass::gemm::collective::KernelScheduleAuto
+        MainloopSchedule_
     >::CollectiveOp;
 
     using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
@@ -289,6 +309,16 @@ struct Fp4GemmResidualGateSm120 {
     using StrideC = typename Gemm::GemmKernel::StrideC;
     using StrideD = typename Gemm::GemmKernel::StrideD;
 };
+
+using Fp4GemmResidualGateSm120 = Fp4GemmResidualGateSm120Config<
+    Shape<_128,_128,_128>, Shape<_1,_1,_1>,
+    cutlass::gemm::collective::KernelScheduleAuto,
+    cutlass::epilogue::collective::EpilogueScheduleAuto>;
+
+using Fp4GemmResidualGateSm120Wan22Ffn2 = Fp4GemmResidualGateSm120Config<
+    Shape<_256,_256,_256>, Shape<_2,_1,_1>,
+    cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100,
+    cutlass::epilogue::TmaWarpSpecialized2SmNvf4>;
 
 
 // Populates a Gemm::Arguments structure from the given commandline options
@@ -400,7 +430,8 @@ void runGemmNvfp4Sm120(
   CUTLASS_CHECK(gemm.run(arguments, workspace.data_ptr(), stream));
 }
 
-typename Fp4GemmResidualGateSm120::Gemm::Arguments
+template <class GemmConfig>
+typename GemmConfig::Gemm::Arguments
 args_from_options_nvfp4_split_n_stride_residual_gate(
     at::Tensor& residual,
     at::Tensor const& A,
@@ -415,7 +446,7 @@ args_from_options_nvfp4_split_n_stride_residual_gate(
     int64_t K,
     int64_t split_n_parts) {
   using Sm1xxBlkScaledConfig =
-      typename Fp4GemmResidualGateSm120::Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+      typename GemmConfig::Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 
   int m = static_cast<int>(M);
   int n = static_cast<int>(N);
@@ -424,11 +455,11 @@ args_from_options_nvfp4_split_n_stride_residual_gate(
   int shard_n = n / batch_count;
 
   auto stride_A = cutlass::make_cute_packed_stride(
-      Fp4GemmResidualGateSm120::StrideA{}, {m, k, batch_count});
+      typename GemmConfig::StrideA{}, {m, k, batch_count});
   auto stride_B = cutlass::make_cute_packed_stride(
-      Fp4GemmResidualGateSm120::StrideB{}, {shard_n, k, batch_count});
+      typename GemmConfig::StrideB{}, {shard_n, k, batch_count});
   auto stride_D = cutlass::make_cute_packed_stride(
-      Fp4GemmResidualGateSm120::StrideD{}, {m, shard_n, batch_count});
+      typename GemmConfig::StrideD{}, {m, shard_n, batch_count});
   cute::get<2>(stride_A) = 0;
   cute::get<0>(stride_D) = n;
   cute::get<2>(stride_D) = shard_n;
@@ -438,13 +469,13 @@ args_from_options_nvfp4_split_n_stride_residual_gate(
   auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(problem_shape);
   cute::get<2, 1>(cute::stride(layout_SFA)) = 0;
 
-  typename Fp4GemmResidualGateSm120::Gemm::Arguments arguments{
+  typename GemmConfig::Gemm::Arguments arguments{
     cutlass::gemm::GemmUniversalMode::kBatched,
     problem_shape,
     {
-      static_cast<Fp4GemmResidualGateSm120::Gemm::ElementA const*>(A.data_ptr()),
+      static_cast<typename GemmConfig::Gemm::ElementA const*>(A.data_ptr()),
       stride_A,
-      static_cast<Fp4GemmResidualGateSm120::Gemm::ElementB const*>(B.data_ptr()),
+      static_cast<typename GemmConfig::Gemm::ElementB const*>(B.data_ptr()),
       stride_B,
       static_cast<cutlass::float_ue4m3_t const*>(A_sf.data_ptr()),
       layout_SFA,
@@ -453,23 +484,23 @@ args_from_options_nvfp4_split_n_stride_residual_gate(
     },
     {
       {},
-      static_cast<Fp4GemmResidualGateSm120::ElementC const*>(residual.data_ptr()),
+      static_cast<typename GemmConfig::ElementC const*>(residual.data_ptr()),
       stride_D,
-      static_cast<Fp4GemmResidualGateSm120::ElementD*>(residual.data_ptr()),
+      static_cast<typename GemmConfig::ElementD*>(residual.data_ptr()),
       stride_D
     }
   };
 
   auto& fusion_args = arguments.epilogue.thread;
   fusion_args.alpha_ptr = static_cast<float const*>(alpha.data_ptr());
-  fusion_args.gate_ptr = static_cast<Fp4GemmResidualGateSm120::ElementD const*>(gate.data_ptr());
+  fusion_args.gate_ptr = static_cast<typename GemmConfig::ElementD const*>(gate.data_ptr());
   using StrideGate = Stride<cutlass::_0, cutlass::_1, int64_t>;
   auto gate_stride = StrideGate{};
   cute::get<2>(gate_stride) = shard_n;
   fusion_args.dGate = gate_stride;
   if (bias) {
     fusion_args.bias_ptr =
-        static_cast<Fp4GemmResidualGateSm120::ElementD const*>(bias->data_ptr());
+        static_cast<typename GemmConfig::ElementD const*>(bias->data_ptr());
     using StrideBias = Stride<cutlass::_0, cutlass::_1, int64_t>;
     auto bias_stride = StrideBias{};
     cute::get<2>(bias_stride) = shard_n;
@@ -478,6 +509,7 @@ args_from_options_nvfp4_split_n_stride_residual_gate(
   return arguments;
 }
 
+template <class GemmConfig>
 void runGemmNvfp4SplitNStrideResidualGateSm120(
     at::Tensor& residual,
     at::Tensor const& A,
@@ -492,10 +524,10 @@ void runGemmNvfp4SplitNStrideResidualGateSm120(
     int64_t k,
     int64_t split_n_parts,
     cudaStream_t stream) {
-  typename Fp4GemmResidualGateSm120::Gemm gemm;
-  auto arguments = args_from_options_nvfp4_split_n_stride_residual_gate(
+  typename GemmConfig::Gemm gemm;
+  auto arguments = args_from_options_nvfp4_split_n_stride_residual_gate<GemmConfig>(
       residual, A, B, A_sf, B_sf, alpha, bias, gate, m, n, k, split_n_parts);
-  size_t workspace_size = Fp4GemmResidualGateSm120::Gemm::get_workspace_size(arguments);
+  size_t workspace_size = GemmConfig::Gemm::get_workspace_size(arguments);
   auto workspace = torch::empty(
       workspace_size, torch::TensorOptions().dtype(torch::kUInt8).device(A.device()));
 
@@ -618,7 +650,8 @@ void cutlass_scaled_nvfp4_mm_sm120(
 // Keep split-N stride argument construction and execution isolated from the
 // regular NVFP4 operator so changes here cannot alter its behavior.
 // prepare the calculation parameters for the gemm
-typename Fp4GemmSm120::Gemm::Arguments args_from_options_nvfp4_nvfp4_split_n_stride(
+template <class GemmConfig>
+typename GemmConfig::Gemm::Arguments args_from_options_nvfp4_nvfp4_split_n_stride(
     at::Tensor& D,
     at::Tensor const& A,
     at::Tensor const& B,
@@ -630,7 +663,7 @@ typename Fp4GemmSm120::Gemm::Arguments args_from_options_nvfp4_nvfp4_split_n_str
     int64_t N,
     int64_t K,
     int64_t split_n_parts) {
-  using Sm1xxBlkScaledConfig = typename Fp4GemmSm120::Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+  using Sm1xxBlkScaledConfig = typename GemmConfig::Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 
   int m = static_cast<int>(M);
   int n = static_cast<int>(N);
@@ -638,9 +671,9 @@ typename Fp4GemmSm120::Gemm::Arguments args_from_options_nvfp4_nvfp4_split_n_str
   int batch_count = static_cast<int>(split_n_parts);
   int shard_n = n / batch_count;
 
-  auto stride_A = cutlass::make_cute_packed_stride(Fp4GemmSm120::StrideA{}, {m, k, batch_count});
-  auto stride_B = cutlass::make_cute_packed_stride(Fp4GemmSm120::StrideB{}, {shard_n, k, batch_count});
-  auto stride_D = cutlass::make_cute_packed_stride(Fp4GemmSm120::StrideD{}, {m, shard_n, batch_count});
+  auto stride_A = cutlass::make_cute_packed_stride(typename GemmConfig::StrideA{}, {m, k, batch_count});
+  auto stride_B = cutlass::make_cute_packed_stride(typename GemmConfig::StrideB{}, {shard_n, k, batch_count});
+  auto stride_D = cutlass::make_cute_packed_stride(typename GemmConfig::StrideD{}, {m, shard_n, batch_count});
 
   // Broadcast A across batches. B batches are consecutive N shards.
   cute::get<2>(stride_A) = 0;
@@ -657,13 +690,13 @@ typename Fp4GemmSm120::Gemm::Arguments args_from_options_nvfp4_nvfp4_split_n_str
   if (bias) {
     using StrideBias = Stride<cutlass::_0, cutlass::_1, int64_t>;
 
-    typename Fp4GemmSm120::Gemm::Arguments arguments{
+    typename GemmConfig::Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kBatched,
       problem_shape,
       {// Mainloop arguments
-       static_cast<Fp4GemmSm120::Gemm::ElementA const*>(A.data_ptr()),
+       static_cast<typename GemmConfig::Gemm::ElementA const*>(A.data_ptr()),
        stride_A,
-       static_cast<Fp4GemmSm120::Gemm::ElementB const*>(B.data_ptr()),
+       static_cast<typename GemmConfig::Gemm::ElementB const*>(B.data_ptr()),
        stride_B,
        static_cast<cutlass::float_ue4m3_t const*>(A_sf.data_ptr()),
        layout_SFA,
@@ -671,13 +704,13 @@ typename Fp4GemmSm120::Gemm::Arguments args_from_options_nvfp4_nvfp4_split_n_str
        layout_SFB},
       {     // Epilogue arguments
        {},  // epilogue.thread
-       static_cast<Fp4GemmSm120::Gemm::ElementC const*>(D.data_ptr()),
+       static_cast<typename GemmConfig::Gemm::ElementC const*>(D.data_ptr()),
        stride_D,
-       static_cast<Fp4GemmSm120::Gemm::ElementD*>(D.data_ptr()),
+       static_cast<typename GemmConfig::Gemm::ElementD*>(D.data_ptr()),
        stride_D}};
     auto& fusion_args = arguments.epilogue.thread;
     fusion_args.alpha_ptr = static_cast<float const*>(alpha.data_ptr());
-    fusion_args.bias_ptr = static_cast<Fp4GemmSm120::Gemm::ElementC const*>(bias->data_ptr());
+    fusion_args.bias_ptr = static_cast<typename GemmConfig::Gemm::ElementC const*>(bias->data_ptr());
     auto stride_bias = StrideBias{};
     cute::get<2>(stride_bias) = shard_n;
     fusion_args.dBias = stride_bias;
@@ -685,13 +718,13 @@ typename Fp4GemmSm120::Gemm::Arguments args_from_options_nvfp4_nvfp4_split_n_str
   }
   else
   {
-    typename Fp4GemmSm120::Gemm::Arguments arguments{
+    typename GemmConfig::Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kBatched,
       problem_shape,
       {// Mainloop arguments
-       static_cast<Fp4GemmSm120::Gemm::ElementA const*>(A.data_ptr()),
+       static_cast<typename GemmConfig::Gemm::ElementA const*>(A.data_ptr()),
        stride_A,
-       static_cast<Fp4GemmSm120::Gemm::ElementB const*>(B.data_ptr()),
+       static_cast<typename GemmConfig::Gemm::ElementB const*>(B.data_ptr()),
        stride_B,
        static_cast<cutlass::float_ue4m3_t const*>(A_sf.data_ptr()),
        layout_SFA,
@@ -699,9 +732,9 @@ typename Fp4GemmSm120::Gemm::Arguments args_from_options_nvfp4_nvfp4_split_n_str
        layout_SFB},
       {     // Epilogue arguments
        {},  // epilogue.thread
-       static_cast<Fp4GemmSm120::Gemm::ElementC const*>(D.data_ptr()),
+       static_cast<typename GemmConfig::Gemm::ElementC const*>(D.data_ptr()),
        stride_D,
-       static_cast<Fp4GemmSm120::Gemm::ElementD*>(D.data_ptr()),
+       static_cast<typename GemmConfig::Gemm::ElementD*>(D.data_ptr()),
        stride_D}};
     auto& fusion_args = arguments.epilogue.thread;
     fusion_args.alpha_ptr = static_cast<float const*>(alpha.data_ptr());
@@ -710,6 +743,7 @@ typename Fp4GemmSm120::Gemm::Arguments args_from_options_nvfp4_nvfp4_split_n_str
 }
 
 // implement the gemm for nvfp4splitnstride
+template <class GemmConfig>
 void runGemmNvfp4SplitNStrideSm120(
     at::Tensor& D,
     at::Tensor const& A,
@@ -723,16 +757,16 @@ void runGemmNvfp4SplitNStrideSm120(
     int64_t k,
     int64_t split_n_parts,
     cudaStream_t stream) {
-  typename Fp4GemmSm120::Gemm gemm;
+  typename GemmConfig::Gemm gemm;
 
-  auto arguments = args_from_options_nvfp4_nvfp4_split_n_stride(
+  auto arguments = args_from_options_nvfp4_nvfp4_split_n_stride<GemmConfig>(
       D, A, B, A_sf, B_sf, alpha, bias, m, n, k, split_n_parts);
   auto beta_dev = torch::zeros({1}, torch::TensorOptions()
                                 .dtype(torch::kFloat32)
                                 .device(A.device()));
   arguments.epilogue.thread.beta_ptr =
       static_cast<float const*>(beta_dev.data_ptr());
-  size_t workspace_size = Fp4GemmSm120::Gemm::get_workspace_size(arguments);
+  size_t workspace_size = GemmConfig::Gemm::get_workspace_size(arguments);
   auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(A.device());
   auto workspace = torch::empty(workspace_size, workspace_options);
 
@@ -887,8 +921,13 @@ void cutlass_scaled_nvfp4_mm_split_n_stride_sm120(
   auto const k = A.sizes()[1] * 2;
   at::cuda::CUDAGuard device_guard{(char)A.get_device()};
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.get_device());
-  runGemmNvfp4SplitNStrideSm120(
-      D, A, B, A_sf, B_sf, alpha, bias, m, n, k, split_n_parts, stream);
+  if (m == 75348 && n == 5120 && k == 13824 && split_n_parts == 2) {
+    runGemmNvfp4SplitNStrideSm120<Fp4GemmSm120Wan22Ffn2>(
+        D, A, B, A_sf, B_sf, alpha, bias, m, n, k, split_n_parts, stream);
+  } else {
+    runGemmNvfp4SplitNStrideSm120<Fp4GemmSm120>(
+        D, A, B, A_sf, B_sf, alpha, bias, m, n, k, split_n_parts, stream);
+  }
 }
 
 void cutlass_scaled_nvfp4_mm_split_n_stride_residual_gate_sm120(
@@ -913,6 +952,11 @@ void cutlass_scaled_nvfp4_mm_split_n_stride_residual_gate_sm120(
   auto const k = A.sizes()[1] * 2;
   at::cuda::CUDAGuard device_guard{(char)A.get_device()};
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.get_device());
-  runGemmNvfp4SplitNStrideResidualGateSm120(
-      residual, A, B, A_sf, B_sf, alpha, bias, gate, m, n, k, split_n_parts, stream);
+  if (m == 75348 && n == 5120 && k == 13824 && split_n_parts == 2) {
+    runGemmNvfp4SplitNStrideResidualGateSm120<Fp4GemmResidualGateSm120Wan22Ffn2>(
+        residual, A, B, A_sf, B_sf, alpha, bias, gate, m, n, k, split_n_parts, stream);
+  } else {
+    runGemmNvfp4SplitNStrideResidualGateSm120<Fp4GemmResidualGateSm120>(
+        residual, A, B, A_sf, B_sf, alpha, bias, gate, m, n, k, split_n_parts, stream);
+  }
 }
