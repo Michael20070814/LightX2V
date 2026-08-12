@@ -446,26 +446,23 @@ class WanSelfAttention(WeightModule):
                 lora_path=lora_path,
             ),
         )
-        if config.get("nvfp4_qkv_fusion", False):
-            from lightx2v.models.networks.wan.weights.nvfp4_qkv import WanNVFP4FusedQKV
-
+        use_nvfp4_qkv_cublaslt = config.get("nvfp4_qkv_cublaslt", False)
+        if use_nvfp4_qkv_cublaslt:
             if mm_type != "nvfp4":
-                raise ValueError("nvfp4_qkv_fusion requires dit_quant_scheme='nvfp4'")
+                raise ValueError("nvfp4_qkv_cublaslt requires dit_quant_scheme='nvfp4'")
             if config.get("tensor_parallel", False):
-                raise NotImplementedError("nvfp4_qkv_fusion does not support tensor parallelism")
+                raise NotImplementedError("nvfp4_qkv_cublaslt does not support tensor parallelism")
             if config.get("cpu_offload", False) or create_cuda_buffer or create_cpu_buffer:
-                raise NotImplementedError("nvfp4_qkv_fusion does not support CPU offload")
+                raise NotImplementedError("nvfp4_qkv_cublaslt does not support CPU offload")
             if lazy_load:
-                raise NotImplementedError("nvfp4_qkv_fusion does not support lazy loading")
+                raise NotImplementedError("nvfp4_qkv_cublaslt does not support lazy loading")
             if lora_path or config.get("lora_configs"):
-                raise NotImplementedError("nvfp4_qkv_fusion does not support LoRA")
+                raise NotImplementedError("nvfp4_qkv_cublaslt does not support LoRA")
             if config.get("feature_caching", "NoCaching") != "NoCaching":
-                raise NotImplementedError("nvfp4_qkv_fusion requires feature_caching='NoCaching'")
-
-            for module_name in ("self_attn_q", "self_attn_k", "self_attn_v"):
-                self._modules.pop(module_name)
-                delattr(self, module_name)
-            self.add_module("self_attn_qkv", WanNVFP4FusedQKV(f"{p}.self_attn"))
+                raise NotImplementedError("nvfp4_qkv_cublaslt requires feature_caching='NoCaching'")
+            algorithm_index = config.get("nvfp4_qkv_cublaslt_algorithm", -1)
+            if isinstance(algorithm_index, bool) or not isinstance(algorithm_index, int) or algorithm_index < -1:
+                raise ValueError("nvfp4_qkv_cublaslt_algorithm must be an integer greater than or equal to -1")
 
         self.add_module(
             "self_attn_o",

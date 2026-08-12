@@ -65,7 +65,6 @@ set(LIGHTX2V_KERNEL_CUDA_FLAGS
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
     "--threads=32"
-    "-Xptxas=-v,-warn-spills"
 
     # Suppress warnings
     "-Xcompiler=-Wconversion"
