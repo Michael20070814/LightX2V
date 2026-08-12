@@ -165,6 +165,56 @@ class WanNvfp4SplitNStrideTest(unittest.TestCase):
             split_n_parts=2,
         )
 
+    def test_gelu_operator_forwards_complete_tensors(self):
+        ensure_lightx2v_pipeline_stub()
+        ensure_local_lightx2v_kernel()
+        mm_weight = import_module("lightx2v.common.ops.mm.mm_weight")
+        operator = mm_weight.MMWeightWnvfp4Anvfp4dynamicSplitNStrideWorkaround(
+            "blocks.0.ffn.0.weight",
+            "blocks.0.ffn.0.bias",
+            split_n_parts=2,
+        )
+        values = {
+            name: object()
+            for name in ("input", "input_quant", "input_scale", "weight", "weight_scale", "alpha", "bias", "output")
+        }
+        operator.act_quant_func = lambda value: (values["input_quant"], values["input_scale"])
+        operator.weight = values["weight"]
+        operator.weight_scale = values["weight_scale"]
+        operator.alpha = values["alpha"]
+        operator.bias = values["bias"]
+
+        with patch.object(
+            mm_weight,
+            "cutlass_scaled_nvfp4_mm_split_n_stride_gelu",
+            return_value=values["output"],
+        ) as kernel:
+            actual = operator.apply_gelu(values["input"])
+
+        self.assertIs(actual, values["output"])
+        kernel.assert_called_once_with(
+            values["input_quant"],
+            values["weight"],
+            values["input_scale"],
+            values["weight_scale"],
+            alpha=values["alpha"],
+            bias=values["bias"],
+            split_n_parts=2,
+        )
+
+    def test_ffn0_gelu_fusion_validation(self):
+        valid = {
+            "nvfp4_ffn_split_n_stride_workaround": True,
+            "nvfp4_ffn_split_n_parts": 2,
+            "nvfp4_ffn0_gelu_fusion": True,
+        }
+        self.make_ffn(**valid)
+
+        with self.assertRaisesRegex(TypeError, "nvfp4_ffn0_gelu_fusion must be a boolean"):
+            self.make_ffn(nvfp4_ffn0_gelu_fusion=1)
+        with self.assertRaisesRegex(ValueError, "requires nvfp4_ffn_split_n_stride_workaround"):
+            self.make_ffn(nvfp4_ffn0_gelu_fusion=True)
+
     def test_residual_gate_fusion_validation(self):
         valid = {
             "nvfp4_ffn_split_n_stride_workaround": True,
@@ -225,6 +275,42 @@ class WanMxfp8FuseForwardingTest(unittest.TestCase):
         enabled._ensure_mxfp8_quant_ffn_ready = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("fuse gate check reached"))
         with self.assertRaisesRegex(RuntimeError, "fuse gate check reached"):
             enabled.infer_ffn(phase, x.clone(), attn_out.clone(), c_shift, c_scale, c_gate_msa=None)
+
+    def test_nvfp4_ffn0_gelu_fusion_dispatches_once(self):
+        ensure_lightx2v_pipeline_stub()
+        ensure_local_lightx2v_kernel()
+        transformer_infer = import_module("lightx2v.models.networks.wan.infer.transformer_infer")
+
+        seen = {}
+
+        def apply_gelu(value):
+            seen["input"] = value.clone()
+            return torch.full_like(value, 3)
+
+        phase = make_linear_phase()
+        phase.ffn_0 = SimpleNamespace(
+            apply=lambda value: (_ for _ in ()).throw(RuntimeError("ordinary FFN0 must be skipped")),
+            apply_gelu=apply_gelu,
+        )
+        phase.ffn_2 = SimpleNamespace(apply=lambda value: value)
+        infer = transformer_infer.WanTransformerInfer(
+            make_config(
+                dit_quant_scheme="nvfp4",
+                mxfp8_fuse_enable=False,
+                nvfp4_ffn0_gelu_fusion=True,
+            )
+        )
+        x = torch.zeros(1, 8)
+        output = infer.infer_ffn(
+            phase,
+            x,
+            torch.zeros_like(x),
+            torch.zeros_like(x),
+            torch.zeros_like(x),
+        )
+
+        self.assertTrue(torch.equal(seen["input"], torch.zeros(8)))
+        self.assertTrue(torch.equal(output, torch.full((8,), 3.0)))
 
     def test_nvfp4_residual_gate_fusion_mutates_x_and_skips_post_process(self):
         ensure_lightx2v_pipeline_stub()
