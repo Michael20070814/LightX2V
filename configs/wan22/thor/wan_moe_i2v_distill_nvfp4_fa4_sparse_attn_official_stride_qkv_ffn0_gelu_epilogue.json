@@ -38,6 +38,7 @@
     "nvfp4_qkv_cublaslt_algorithm": -1,
     "nvfp4_ffn_split_n_stride_workaround": true,
     "nvfp4_ffn_split_n_parts": 2,
+    "nvfp4_ffn2_residual_gate_fusion": true,
     "nvfp4_ffn0_gelu_fusion": true,
     "use_compile": false
 }
