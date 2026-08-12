@@ -50,6 +50,31 @@ def cutlass_scaled_nvfp4_mm_split_n_stride(mat_a, mat_b, scales_a, scales_b, alp
     return out
 
 
+def cutlass_scaled_nvfp4_mm_split_n_stride_residual_gate(
+    mat_a,
+    mat_b,
+    scales_a,
+    scales_b,
+    alpha,
+    residual,
+    gate,
+    bias=None,
+    split_n_parts=2,
+):
+    torch.ops.lightx2v_kernel.cutlass_scaled_nvfp4_mm_split_n_stride_residual_gate_sm120.default(
+        residual,
+        mat_a,
+        mat_b,
+        scales_a,
+        scales_b,
+        alpha,
+        bias,
+        gate.contiguous(),
+        split_n_parts,
+    )
+    return residual
+
+
 def scaled_nvfp4_quant(input: torch.Tensor, input_global_scale: torch.Tensor):
     """
     Quantize input tensor to FP4 and return quantized tensor and scale.

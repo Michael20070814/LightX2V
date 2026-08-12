@@ -64,6 +64,7 @@ class WanNvfp4SplitNStrideTest(unittest.TestCase):
     def make_ffn(**overrides):
         ensure_lightx2v_pipeline_stub()
         ensure_local_lightx2v_kernel()
+        lazy_load = overrides.pop("lazy_load", False)
         transformer_weights = import_module("lightx2v.models.networks.wan.weights.transformer_weights")
         config = {
             "layer_norm_type": "torch",
@@ -76,6 +77,7 @@ class WanNvfp4SplitNStrideTest(unittest.TestCase):
             task="i2v",
             mm_type="nvfp4",
             config=config,
+            lazy_load=lazy_load,
         )
 
     def test_stride_workaround_selects_full_weight_operator_for_both_ffn_layers(self):
@@ -127,6 +129,63 @@ class WanNvfp4SplitNStrideTest(unittest.TestCase):
             split_n_parts=2,
         )
 
+    def test_residual_gate_operator_forwards_complete_tensors(self):
+        ensure_lightx2v_pipeline_stub()
+        ensure_local_lightx2v_kernel()
+        mm_weight = import_module("lightx2v.common.ops.mm.mm_weight")
+        operator = mm_weight.MMWeightWnvfp4Anvfp4dynamicSplitNStrideWorkaround(
+            "blocks.0.ffn.2.weight",
+            "blocks.0.ffn.2.bias",
+            split_n_parts=2,
+        )
+        values = {name: object() for name in ("input", "input_quant", "input_scale", "weight", "weight_scale", "alpha", "bias", "residual", "gate")}
+        operator.act_quant_func = lambda value: (values["input_quant"], values["input_scale"])
+        operator.weight = values["weight"]
+        operator.weight_scale = values["weight_scale"]
+        operator.alpha = values["alpha"]
+        operator.bias = values["bias"]
+
+        with patch.object(
+            mm_weight,
+            "cutlass_scaled_nvfp4_mm_split_n_stride_residual_gate",
+            return_value=values["residual"],
+        ) as kernel:
+            actual = operator.apply_residual_gate(values["input"], values["residual"], values["gate"])
+
+        self.assertIs(actual, values["residual"])
+        kernel.assert_called_once_with(
+            values["input_quant"],
+            values["weight"],
+            values["input_scale"],
+            values["weight_scale"],
+            alpha=values["alpha"],
+            residual=values["residual"],
+            gate=values["gate"],
+            bias=values["bias"],
+            split_n_parts=2,
+        )
+
+    def test_residual_gate_fusion_validation(self):
+        valid = {
+            "nvfp4_ffn_split_n_stride_workaround": True,
+            "nvfp4_ffn_split_n_parts": 2,
+            "nvfp4_ffn2_residual_gate_fusion": True,
+        }
+        self.make_ffn(**valid)
+
+        invalid_cases = [
+            ({"nvfp4_ffn2_residual_gate_fusion": 1}, TypeError, "must be a boolean"),
+            ({"nvfp4_ffn2_residual_gate_fusion": True}, ValueError, "requires nvfp4_ffn_split_n_stride_workaround"),
+            ({**valid, "tensor_parallel": True}, NotImplementedError, "tensor parallelism"),
+            ({**valid, "cpu_offload": True}, NotImplementedError, "CPU offload"),
+            ({**valid, "lazy_load": True}, NotImplementedError, "lazy loading"),
+            ({**valid, "lora_configs": [{}]}, NotImplementedError, "LoRA"),
+        ]
+        for extra_config, error_type, message in invalid_cases:
+            with self.subTest(extra_config=extra_config):
+                with self.assertRaisesRegex(error_type, message):
+                    self.make_ffn(**extra_config)
+
     def test_stride_flag_must_be_boolean(self):
         with self.assertRaisesRegex(TypeError, "nvfp4_ffn_split_n_stride_workaround must be a boolean"):
             self.make_ffn(nvfp4_ffn_split_n_stride_workaround=1, nvfp4_ffn_split_n_parts=2)
@@ -166,6 +225,46 @@ class WanMxfp8FuseForwardingTest(unittest.TestCase):
         enabled._ensure_mxfp8_quant_ffn_ready = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("fuse gate check reached"))
         with self.assertRaisesRegex(RuntimeError, "fuse gate check reached"):
             enabled.infer_ffn(phase, x.clone(), attn_out.clone(), c_shift, c_scale, c_gate_msa=None)
+
+    def test_nvfp4_residual_gate_fusion_mutates_x_and_skips_post_process(self):
+        ensure_lightx2v_pipeline_stub()
+        ensure_local_lightx2v_kernel()
+        transformer_infer = import_module("lightx2v.models.networks.wan.infer.transformer_infer")
+
+        gate = torch.full((1, 8), 0.5)
+        phase = make_linear_phase()
+        seen = {}
+
+        def apply_residual_gate(y, residual, actual_gate):
+            seen["gate"] = actual_gate
+            residual.add_(3)
+            return residual
+
+        phase.ffn_2 = SimpleNamespace(
+            apply=lambda y: (_ for _ in ()).throw(RuntimeError("ordinary FFN2 must be skipped")),
+            apply_residual_gate=apply_residual_gate,
+        )
+        infer = transformer_infer.WanTransformerInfer(
+            make_config(
+                dit_quant_scheme="nvfp4",
+                mxfp8_fuse_enable=False,
+                nvfp4_ffn2_residual_gate_fusion=True,
+            )
+        )
+        x = torch.zeros(1, 8)
+        y = infer.infer_ffn(
+            phase,
+            x,
+            torch.zeros_like(x),
+            torch.zeros_like(x),
+            torch.zeros_like(x),
+            gate,
+        )
+
+        self.assertIsNone(y)
+        self.assertTrue(torch.equal(x, torch.full_like(x, 3)))
+        self.assertTrue(torch.equal(seen["gate"], gate.squeeze()))
+        self.assertIs(infer.post_process(x, y, gate), x)
 
     def test_offload_phase_two_forwards_c_gate_msa(self):
         ensure_lightx2v_pipeline_stub()

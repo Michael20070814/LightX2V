@@ -40,6 +40,7 @@ class WanTransformerInfer(WanMxfp8FuseMixin, BaseTransformerInfer):
             self.modulate_func = modulate
         self.clean_cuda_cache = self.config.get("clean_cuda_cache", False)
         self.mxfp8_fuse_enable = self.config.get("mxfp8_fuse_enable", True)
+        self.nvfp4_ffn2_residual_gate_fusion = self.config.get("nvfp4_ffn2_residual_gate_fusion", False)
         self.infer_dtype = GET_DTYPE()
         self.sensitive_layer_dtype = GET_SENSITIVE_DTYPE()
 
@@ -443,6 +444,10 @@ class WanTransformerInfer(WanMxfp8FuseMixin, BaseTransformerInfer):
         y = torch.nn.functional.gelu(y, approximate="tanh")
         if self.clean_cuda_cache:
             torch_device_module.empty_cache()
+        if self.nvfp4_ffn2_residual_gate_fusion:
+            phase.ffn_2.apply_residual_gate(y, x, c_gate_msa.squeeze())
+            return None
+
         y = phase.ffn_2.apply(y)
 
         return y
