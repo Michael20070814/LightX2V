@@ -456,8 +456,8 @@ struct Fp4GemmGeluSm120 {
 #endif
     using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
 
-    using ThreadBlockShape = Shape<_128,_128,_128>;
-    using ClusterShape = Shape<_1,_1,_1>;
+    using ThreadBlockShape = Shape<_256,_256,_256>;
+    using ClusterShape = Shape<_2,_1,_1>;
 
     using EVTOp = cutlass::epilogue::fusion::LinCombPerColBiasBf16Gelu<
         ElementD, ElementAccumulator, ElementD, ElementC, ElementAccumulator>;
