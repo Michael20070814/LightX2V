@@ -12,6 +12,7 @@ from lightx2v_platform.base.global_var import AI_DEVICE
 
 from .mxfp8_fuse import WanMxfp8FuseMixin, scaled_mxfp8_modulate_quant
 from .triton_ops import fuse_scale_shift_kernel
+from .wan22.fused_qk_rmsnorm_rope import apply_fused_wan_qk_rmsnorm_rope_
 
 torch_device_module = getattr(torch, AI_DEVICE)
 
@@ -46,6 +47,7 @@ class WanTransformerInfer(WanMxfp8FuseMixin, BaseTransformerInfer):
         self.mxfp8_fuse_enable = self.config.get("mxfp8_fuse_enable", True)
         self.nvfp4_ffn0_gelu_fusion = self.config.get("nvfp4_ffn0_gelu_fusion", False)
         self.nvfp4_ffn2_residual_gate_fusion = self.config.get("nvfp4_ffn2_residual_gate_fusion", False)
+        self.nvfp4_qkv_rmsnorm_rope_fusion = self.config.get("nvfp4_qkv_rmsnorm_rope_fusion", False)
         self.infer_dtype = GET_DTYPE()
         self.sensitive_layer_dtype = GET_SENSITIVE_DTYPE()
 
@@ -316,13 +318,27 @@ class WanTransformerInfer(WanMxfp8FuseMixin, BaseTransformerInfer):
                 phase._nvfp4_qkv_cublaslt_scale_checked = True
             qkv_quant, qkv_scale = q_proj.act_quant_func(norm1_out)
             algorithm_index = self.config.get("nvfp4_qkv_cublaslt_algorithm", -1)
-            q = phase.self_attn_norm_q.apply(
-                q_proj.apply_quantized_cublaslt(qkv_quant, qkv_scale, algorithm_index)
-            ).view(s, n, d)
-            k = phase.self_attn_norm_k.apply(
-                k_proj.apply_quantized_cublaslt(qkv_quant, qkv_scale, algorithm_index)
-            ).view(s, n, d)
+            q = q_proj.apply_quantized_cublaslt(qkv_quant, qkv_scale, algorithm_index)
+            k = k_proj.apply_quantized_cublaslt(qkv_quant, qkv_scale, algorithm_index)
             v = v_proj.apply_quantized_cublaslt(qkv_quant, qkv_scale, algorithm_index).view(s, n, d)
+            if self.nvfp4_qkv_rmsnorm_rope_fusion:
+                if self.rope_positions is None:
+                    raise NotImplementedError("nvfp4_qkv_rmsnorm_rope_fusion requires explicit RoPE positions")
+                q = q.view(s, n, d)
+                k = k.view(s, n, d)
+                rope_cache = phase.rope.prepare_freqs(cos_sin, rotary_dim=d)
+                apply_fused_wan_qk_rmsnorm_rope_(
+                    q,
+                    k,
+                    phase.self_attn_norm_q._get_actual_weight(),
+                    phase.self_attn_norm_k._get_actual_weight(),
+                    rope_cache,
+                    self.rope_positions,
+                    phase.self_attn_norm_q.eps,
+                )
+            else:
+                q = phase.self_attn_norm_q.apply(q).view(s, n, d)
+                k = phase.self_attn_norm_k.apply(k).view(s, n, d)
         elif norm1_quant is not None:
             q = phase.self_attn_norm_q.apply(self._mxfp8_apply_quantized(phase.self_attn_q, norm1_quant, norm1_scale)).view(s, n, d)
             k = phase.self_attn_norm_k.apply(self._mxfp8_apply_quantized(phase.self_attn_k, norm1_quant, norm1_scale)).view(s, n, d)
@@ -331,10 +347,11 @@ class WanTransformerInfer(WanMxfp8FuseMixin, BaseTransformerInfer):
             q = phase.self_attn_norm_q.apply(phase.self_attn_q.apply(norm1_out)).view(s, n, d)
             k = phase.self_attn_norm_k.apply(phase.self_attn_k.apply(norm1_out)).view(s, n, d)
             v = phase.self_attn_v.apply(norm1_out).view(s, n, d)
-        if self.rope_positions is None:
-            q, k = phase.rope.apply(q, k, cos_sin)
-        else:
-            q, k = phase.rope.apply(q, k, cos_sin, positions=self.rope_positions)
+        if not self.nvfp4_qkv_rmsnorm_rope_fusion:
+            if self.rope_positions is None:
+                q, k = phase.rope.apply(q, k, cos_sin)
+            else:
+                q, k = phase.rope.apply(q, k, cos_sin, positions=self.rope_positions)
         img_qkv_len = q.shape[0]
         if self.clean_cuda_cache:
             del norm1_out, shift_msa, scale_msa

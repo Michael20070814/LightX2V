@@ -434,6 +434,14 @@ class WanSelfAttention(WeightModule):
             ),
         )
         use_nvfp4_qkv_cublaslt = config.get("nvfp4_qkv_cublaslt", False)
+        use_nvfp4_qkv_rmsnorm_rope_fusion = config.get("nvfp4_qkv_rmsnorm_rope_fusion", False)
+        if use_nvfp4_qkv_rmsnorm_rope_fusion and not use_nvfp4_qkv_cublaslt:
+            raise ValueError("nvfp4_qkv_rmsnorm_rope_fusion requires nvfp4_qkv_cublaslt=true")
+        if use_nvfp4_qkv_rmsnorm_rope_fusion:
+            if config.get("rope_type", "flashinfer_rope") != "flashinfer_rope" or config.get("rope_chunk", False):
+                raise ValueError("nvfp4_qkv_rmsnorm_rope_fusion requires unchunked flashinfer_rope")
+            if config.get("tensor_parallel", False) or config.get("seq_parallel", False):
+                raise NotImplementedError("nvfp4_qkv_rmsnorm_rope_fusion does not support tensor or sequence parallelism")
         if use_nvfp4_qkv_cublaslt:
             if mm_type != "nvfp4":
                 raise ValueError("nvfp4_qkv_cublaslt requires dit_quant_scheme='nvfp4'")

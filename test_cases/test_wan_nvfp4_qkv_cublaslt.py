@@ -83,3 +83,26 @@ class WanNvfp4QkvCublasltTest(unittest.TestCase):
                 mm_type="Default",
                 config=config,
             )
+
+    def test_rmsnorm_rope_fusion_requires_cublaslt(self):
+        transformer_weights = import_module(
+            "lightx2v.models.networks.wan.weights.transformer_weights"
+        )
+        config = {
+            "rope_type": "flashinfer_rope",
+            "layer_norm_type": "torch",
+            "rms_norm_type": "torch",
+            "tensor_parallel": False,
+            "seq_parallel": False,
+            "nvfp4_qkv_cublaslt": False,
+            "nvfp4_qkv_rmsnorm_rope_fusion": True,
+        }
+
+        with self.assertRaisesRegex(ValueError, "requires nvfp4_qkv_cublaslt=true"):
+            transformer_weights.WanSelfAttention(
+                block_index=0,
+                block_prefix="blocks",
+                task="i2v",
+                mm_type="nvfp4",
+                config=config,
+            )
