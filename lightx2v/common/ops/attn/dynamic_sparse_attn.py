@@ -8,7 +8,7 @@ from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER
 from .kernels.sla_kernel import _attention
 from .kernels.sla_kernel_ar import _attention_ar
 from .template import AttnWeightTemplate
-from .utils.sla_util import get_block_map, get_cuda_arch
+from .utils.sla_util import block_lut_to_ordinal_metadata, get_block_lut, get_block_map, get_cuda_arch
 from .utils.sla_util_blhd import get_block_map_blhd
 from .utils.sparge_util import block_map_incremental_lut_triton, block_map_ordinal_lut_triton, sage2_block_sparse_attn
 
@@ -226,7 +226,7 @@ class DynamicSparseAttnWeight(AttnWeightTemplate):
         # (L, H, D) -> (B, L, H, D)
         qt = q.unsqueeze(0).transpose(1, 2).contiguous()
         kt = k.unsqueeze(0).transpose(1, 2).contiguous()
-        sparse_map, lut, real_topk = get_block_map(qt, kt, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
+        lut, _, num_k_blocks = get_block_lut(qt, kt, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
 
         # (L, H, D) -> (B, L, H, D)
         q = q.unsqueeze(0)
@@ -234,7 +234,7 @@ class DynamicSparseAttnWeight(AttnWeightTemplate):
         v = v.unsqueeze(0)
 
         # (B, H, Q_block_num, K_block_num)
-        full_block_idx, full_block_cnt = block_map_ordinal_lut_triton(sparse_map)
+        full_block_idx, full_block_cnt = block_lut_to_ordinal_metadata(lut, num_k_blocks)
         mask_block_cnt = torch.zeros_like(full_block_cnt)
         mask_block_idx = torch.zeros_like(full_block_idx)
         sparse_kwargs = {
