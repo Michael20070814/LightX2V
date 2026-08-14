@@ -1,4 +1,5 @@
 import inspect
+from functools import wraps
 
 import torch
 from loguru import logger
@@ -59,6 +60,67 @@ def _detect_fa4_sparse_api():
 
 
 _FA4_SPARSE_API = _detect_fa4_sparse_api()
+
+
+_FA4_BLOCKSPARSE_OP = None
+
+
+if flash_attn_func_v4 is not None:
+    _fa4_impl = flash_attn_func_v4
+
+    # Keep the FA4 kernel eager while exposing a tensor-only boundary to
+    # Dynamo; upstream blocksparse/callable FA4 is eager-only today.
+    if hasattr(torch.library, "custom_op"):
+        try:
+
+            @torch.library.custom_op("lightx2v_internal::fa4_blocksparse", mutates_args=())
+            def _fa4_blocksparse_op(
+                q: torch.Tensor,
+                k: torch.Tensor,
+                v: torch.Tensor,
+                mask_block_cnt: torch.Tensor,
+                mask_block_idx: torch.Tensor,
+                full_block_cnt: torch.Tensor,
+                full_block_idx: torch.Tensor,
+                block_q: int,
+                block_k: int,
+            ) -> torch.Tensor:
+                out, _ = _fa4_impl(
+                    q=q,
+                    k=k,
+                    v=v,
+                    mask_block_cnt=mask_block_cnt,
+                    mask_block_idx=mask_block_idx,
+                    full_block_cnt=full_block_cnt,
+                    full_block_idx=full_block_idx,
+                    block_size=(block_q, block_k),
+                )
+                return out
+
+            @_fa4_blocksparse_op.register_fake
+            def _fa4_blocksparse_op_fake(
+                q,
+                k,
+                v,
+                mask_block_cnt,
+                mask_block_idx,
+                full_block_cnt,
+                full_block_idx,
+                block_q,
+                block_k,
+            ):
+                return torch.empty_like(q)
+
+            _FA4_BLOCKSPARSE_OP = _fa4_blocksparse_op
+        except RuntimeError as exc:
+            # Module reloads can encounter an already registered op.
+            logger.debug("FA4 blocksparse custom op registration skipped: {}", exc)
+
+    @torch.compiler.disable
+    @wraps(_fa4_impl)
+    def flash_attn_func_v4(*args, **kwargs):
+        """Keep the blocksparse FA4 wrapper and kernel outside Dynamo fake mode."""
+        return _fa4_impl(*args, **kwargs)
 
 
 @ATTN_WEIGHT_REGISTER("dynamic_sparse_attn")
@@ -247,14 +309,40 @@ class DynamicSparseAttnWeight(AttnWeightTemplate):
         if _FA4_SPARSE_API == "block_sparse_tensors":
             if BlockSparseTensorsTorch is None:
                 raise RuntimeError("FA4 expects block_sparse_tensors, but BlockSparseTensorsTorch is unavailable")
-            out, _ = flash_attn_func_v4(
-                q=q,
-                k=k,
-                v=v,
-                block_sparse_tensors=BlockSparseTensorsTorch(**sparse_kwargs),
-            )
+            if _FA4_BLOCKSPARSE_OP is not None and torch.compiler.is_compiling():
+                out = _FA4_BLOCKSPARSE_OP(
+                    q,
+                    k,
+                    v,
+                    mask_block_cnt,
+                    mask_block_idx,
+                    full_block_cnt,
+                    full_block_idx,
+                    self.BLKQ,
+                    self.BLKK,
+                )
+            else:
+                out, _ = flash_attn_func_v4(
+                    q=q,
+                    k=k,
+                    v=v,
+                    block_sparse_tensors=BlockSparseTensorsTorch(**sparse_kwargs),
+                )
         elif _FA4_SPARSE_API == "expanded":
-            out, _ = flash_attn_func_v4(q=q, k=k, v=v, **sparse_kwargs)
+            if _FA4_BLOCKSPARSE_OP is not None and torch.compiler.is_compiling():
+                out = _FA4_BLOCKSPARSE_OP(
+                    q,
+                    k,
+                    v,
+                    mask_block_cnt,
+                    mask_block_idx,
+                    full_block_cnt,
+                    full_block_idx,
+                    self.BLKQ,
+                    self.BLKK,
+                )
+            else:
+                out, _ = flash_attn_func_v4(q=q, k=k, v=v, **sparse_kwargs)
         else:
             raise RuntimeError(
                 "Unsupported FA4 sparse attention API: expected block_sparse_tensors or expanded sparse parameters"
