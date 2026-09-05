@@ -10,7 +10,6 @@ from PIL import Image
 from lightx2v_train.model_capabilities import FlowMatchingSFTCapability
 from lightx2v_train.model_zoo.base import BaseModel
 from lightx2v_train.model_zoo.native.minimax_h3 import audio_latent_num_frames, video_latent_num_frames
-from lightx2v_train.utils.registry import MODEL_REGISTER
 
 from .minimax_h3_t2av import MiniMaxH3T2AVModel
 from .world_condition_encoder import MiniMaxH3WorldConditionEncoder
@@ -31,7 +30,39 @@ def tensor_image(frame):
     return Image.fromarray(array, mode="RGB")
 
 
-@MODEL_REGISTER("minimax_h3_world")
+def encode_world_condition(model, first_frame, prompt, script, num_frames, latent_hw, *, seed, pad_used_to=None):
+    latent_t = video_latent_num_frames(num_frames)
+    if len(script) != latent_t:
+        raise ValueError("Expected one action sentence per video latent frame.")
+    first_latent = model._encode_video_latents(first_frame.unsqueeze(0))
+    if first_latent.shape != (1, 24, 1, *latent_hw):
+        raise ValueError("The first-frame VAE output must match the target latent geometry.")
+    anchor = patchify(first_latent).to(model.running_dtype)
+    augmentation = float(model.config["model"].get("imgvid_cond_noise_aug", 0.999))
+    if not 0 <= augmentation <= 1:
+        raise ValueError("imgvid_cond_noise_aug must lie in [0,1].")
+    if augmentation != 1:
+        # The reference draws T+1 frames and uses its first latent as anchor noise.
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        noise = torch.randn((1, 24, latent_t + 1, *latent_hw), generator=generator, dtype=model.running_dtype)
+        noise_rows = patchify(noise[:, :, :1]).to(anchor.device)
+        amount = anchor.new_tensor(augmentation)
+        anchor = amount * anchor + (1 - amount) * noise_rows
+    condition = model.condition_encoder.encode_world(prompt, tensor_image(first_frame), script)
+    spans = condition["action_text_spans"]
+    packed = WorldPackedSequenceBuilder()._build_packed_fl2va(
+        condition["prompt_embeds"].shape[0], latent_t, *latent_hw,
+        audio_latent_num_frames(num_frames), [0], action_text_spans=spans, pad_used_to=pad_used_to,
+    )
+    packed["token_tags"][packed["text_pos"]] = condition["text_token_tags"]
+    packed["refiner_cu_seqlens"] = torch.tensor([0, spans[0][0], *[hi for _, hi in spans]], dtype=torch.int32)
+    condition.update(
+        packed=packed, keyframe_cond_anchor=anchor.contiguous(), keyframe_indices=[0],
+        imgvid_cond_noise_aug=augmentation, action_script=list(script), action_pad_used_to=packed["seq_len"],
+    )
+    return condition
+
+
 class MiniMaxH3WorldCacheModel(MiniMaxH3T2AVModel):
     condition_encoder_cls = MiniMaxH3WorldConditionEncoder
 
@@ -42,7 +73,7 @@ class MiniMaxH3WorldCacheModel(MiniMaxH3T2AVModel):
     def load_components(self, *, load_transformer, load_vae, load_condition_encoder):
         if load_transformer:
             raise NotImplementedError("minimax_h3_world currently builds caches only; its SFT consumer is a separate task.")
-        if self.config["training"]["method"] != "flow_matching":
+        if self.config.get("training", {}).get("method", "flow_matching") != "flow_matching":
             raise ValueError("The world cache contract targets Flow Matching SFT.")
         for split in ("train", "val"):
             if self.config.get("data", {}).get(split, {}).get("prompt_dropout_rate", 0):
@@ -138,40 +169,11 @@ class WorldCacheCapability(FlowMatchingSFTCapability):
         expected_audio = audio_latent_num_frames(sample["meta"]["num_frames"])
         if video.shape[2] != latent_t or audio.shape[-1] != expected_audio:
             raise ValueError("VAE output lengths do not match the selected video/action timeline.")
-        first_frame = sample["inputs"]["first_frame"]
-        first_latent = model._encode_video_latents(first_frame.unsqueeze(0))
-        if first_latent.shape[2] != 1:
-            raise ValueError("The installed H3 VAE must encode a single image as one latent frame.")
-        clean_anchor = patchify(first_latent).to(model.running_dtype)
-        config = model.config["model"]
-        augmentation = float(config.get("imgvid_cond_noise_aug", 0.999))
-        if not 0 <= augmentation <= 1:
-            raise ValueError("imgvid_cond_noise_aug must lie in [0,1].")
-        anchor_seed = int(config.get("condition_seed", 42))
-        if augmentation != 1:
-            # Match the reference RNG layout, which draws a full T+1 video
-            # and uses its first latent frame as the first-frame anchor noise.
-            generator = torch.Generator(device="cpu").manual_seed(anchor_seed)
-            noise = torch.randn((1, 24, latent_t + 1, *video.shape[-2:]), generator=generator, dtype=model.running_dtype)
-            noise_rows = patchify(noise[:, :, :1]).to(clean_anchor.device)
-            amount = clean_anchor.new_tensor(augmentation)
-            clean_anchor = amount * clean_anchor + (1 - amount) * noise_rows
-        prompt, script = sample["conditioning"]["prompt"], sample["conditioning"]["action_script"]
-        condition = model.condition_encoder.encode_world(prompt, tensor_image(first_frame), script)
-        spans = condition["action_text_spans"]
-        packed = self.builder._build_packed_fl2va(
-            condition["prompt_embeds"].shape[0],
-            latent_t,
-            *video.shape[-2:],
-            expected_audio,
-            [0],
-            action_text_spans=spans,
-            pad_used_to=self.pad_used_to,
-        )
-        packed["token_tags"][packed["text_pos"]] = condition["text_token_tags"]
-        packed["refiner_cu_seqlens"] = torch.tensor([0, spans[0][0], *[hi for _, hi in spans]], dtype=torch.int32)
-        condition.update(
-            packed=packed, keyframe_cond_anchor=clean_anchor.contiguous(), keyframe_indices=[0], imgvid_cond_noise_aug=augmentation, action_script=list(script), action_pad_used_to=self.pad_used_to
+        anchor_seed = int(model.config["model"].get("condition_seed", 42))
+        prompt = sample["conditioning"]["prompt"]
+        condition = encode_world_condition(
+            model, sample["inputs"]["first_frame"], prompt, sample["conditioning"]["action_script"],
+            sample["meta"]["num_frames"], video.shape[-2:], seed=anchor_seed, pad_used_to=self.pad_used_to,
         )
         return {
             "inputs": {"video_latents": video, "audio_latents": audio},

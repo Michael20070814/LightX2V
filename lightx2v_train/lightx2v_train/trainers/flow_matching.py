@@ -7,8 +7,9 @@ from lightx2v_train.model_capabilities import (
     FlowMatchingSFTCapability,
     SFTStepContext,
 )
-from lightx2v_train.runtime.distributed import barrier, get_world_size, is_main_process, reduce_mean
+from lightx2v_train.runtime.distributed import barrier, get_tensor_parallel_world_size, get_world_size, is_main_process, reduce_mean
 from lightx2v_train.runtime.sequence_parallel import broadcast_sequence_parallel_value, sync_sequence_parallel_gradients
+from lightx2v_train.runtime.tensor_parallel import clip_tensor_parallel_grad_norm_, sync_tensor_parallel_gradients
 from lightx2v_train.utils.registry import TRAINER_REGISTER
 
 from .base import BaseTrainer
@@ -70,13 +71,18 @@ class FlowMatchingTrainer(BaseTrainer):
             if current_iter == 0:
                 self.run_inference(current_iter)
 
-        epoch = 0
+        if len(self.dataloader_train) == 0:
+            raise ValueError("Training dataloader is empty.")
+        consumed = current_iter * grad_accum_iters if get_tensor_parallel_world_size() > 1 else 0
+        epoch, resume_offset = divmod(consumed, len(self.dataloader_train))
         while current_iter < max_train_iters:
             sampler = getattr(self.dataloader_train, "sampler", None)
             if hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(epoch)
 
-            for sample in self.dataloader_train:
+            for sample_index, sample in enumerate(self.dataloader_train):
+                if sample_index < resume_offset:
+                    continue
                 sync_grad = (grad_accum_counter + 1) % grad_accum_iters == 0
                 self._set_gradient_sync(sync_grad)
 
@@ -94,7 +100,7 @@ class FlowMatchingTrainer(BaseTrainer):
                     continue
 
                 self._after_backward()
-                torch.nn.utils.clip_grad_norm_(self.trainable_params, max_grad_norm)
+                clip_tensor_parallel_grad_norm_(self.trainable_params, max_grad_norm)
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad()
@@ -129,8 +135,10 @@ class FlowMatchingTrainer(BaseTrainer):
                     break
 
             epoch += 1
+            resume_offset = 0
 
         logger.info("[train] finished iter={}/{}", current_iter, max_train_iters)
 
     def _after_backward(self):
         sync_sequence_parallel_gradients(self.trainable_params)
+        sync_tensor_parallel_gradients(self.trainable_params)

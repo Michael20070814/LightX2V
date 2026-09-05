@@ -8,6 +8,12 @@ from lightx2v_train.runtime.fsdp import apply_fsdp2, fsdp2_enabled
 def apply_parallel(model, config):
     """Apply the configured distributed parallel strategy exactly once."""
 
+    if config.get("distributed", {}).get("tensor_parallel", {}).get("enabled", False):
+        if not hasattr(model, "apply_tensor_parallel"):
+            raise ValueError("This model does not implement training tensor parallelism.")
+        model.apply_tensor_parallel()
+        return model
+
     if not is_distributed():
         return model
 

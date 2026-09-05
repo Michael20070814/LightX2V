@@ -83,7 +83,7 @@ _MODEL_MODULES = {
     "longcat_image": "lightx2v_train.model_zoo.longcat_image.longcat_image",
     "longcat_image_edit": "lightx2v_train.model_zoo.longcat_image.longcat_image_edit",
     "minimax_h3_t2av": "lightx2v_train.model_zoo.minimax_h3.minimax_h3_t2av",
-    "minimax_h3_world": "lightx2v_train.model_zoo.minimax_h3.world_cache",
+    "minimax_h3_world": "lightx2v_train.model_zoo.minimax_h3.minimax_h3_world",
     "qwen_image": "lightx2v_train.model_zoo.qwen_image.qwen_image",
     "qwen_image_edit": "lightx2v_train.model_zoo.qwen_image.qwen_image_edit",
     "wan_t2v": "lightx2v_train.model_zoo.wan.wan_t2v",
@@ -104,6 +104,7 @@ _TRAINER_MODULES = {
 }
 
 _INFERENCER_MODULES = {
+    "minimax_h3_world_infer": "lightx2v_train.infer.minimax_h3_world",
     "image_infer": "lightx2v_train.infer.image",
     "lingbot_video_t2v_infer": "lightx2v_train.infer.video",
     "wan_t2v_infer": "lightx2v_train.infer.video",
@@ -144,6 +145,8 @@ def _ensure_data_registered(data_name):
         import lightx2v_train.data.cache_dataset  # noqa: F401
     elif data_name == "abot_dataset":
         import lightx2v_train.model_zoo.minimax_h3.abot_dataset  # noqa: F401
+    elif data_name == "minimax_h3_world_infer":
+        import lightx2v_train.model_zoo.minimax_h3.world_infer_data  # noqa: F401
     elif data_name in {"prompt_dataset", "video_dataset"}:
         import lightx2v_train.data.video_dataset  # noqa: F401
 

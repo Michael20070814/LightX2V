@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
-from lightx2v_train.runtime.distributed import get_data_parallel_rank, get_data_parallel_world_size
+from lightx2v_train.runtime.distributed import get_data_parallel_rank, get_data_parallel_world_size, get_tensor_parallel_world_size
 from lightx2v_train.utils.generation_shapes import (
     GenerationShapeSampler,
     generation_shape_key,
@@ -172,7 +172,7 @@ def build_cache_dataset(
         )
         shuffle = False
         drop_last = False
-    elif world_size > 1 and train_or_val == "train":
+    elif (world_size > 1 or get_tensor_parallel_world_size() > 1) and train_or_val == "train":
         sampler = DistributedSampler(
             dataset,
             num_replicas=world_size,

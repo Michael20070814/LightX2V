@@ -1,0 +1,56 @@
+model:
+    name: minimax_h3_world
+    pretrained_model_name_or_path: ${oc.env:H3_MODEL_ROOT}
+    running_dtype: bf16
+    transformer_param_dtype: bf16
+    latent_dtype: fp32
+    local_files_only: true
+    attention_backend: flex
+    cache_encoder_cpu_offload: true
+    cache_condition_encoder_cpu_offload: true
+    vae_tiling: true
+    imgvid_cond_noise_aug: 0.999
+
+distributed:
+    backend: nccl
+    timeout_minutes: 60
+    tensor_parallel:
+        enabled: true
+        size: 2
+    fsdp2:
+        enabled: false
+    sequence_parallel:
+        enabled: false
+
+data:
+    val:
+        name: minimax_h3_world_infer
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        height: 480
+        width: 832
+        num_frames: 124
+        samples:
+            - first_frame: ${oc.env:H3_FIRST_FRAME}
+              prompt: ${oc.env:H3_SCENE_PROMPT}
+              action_preset: forward
+
+scheduler:
+    num_train_timesteps: 1000
+
+inference:
+    method: minimax_h3_world_infer
+    output_dir: ${oc.env:H3_INFER_OUTPUT}
+    num_inference_steps: 50
+    seed: 0
+    enable_cfg: false
+    video_flow_shift: 12.0
+    audio_flow_shift: 3.0
+    transformer_cpu_offload: true
+    lora_config:
+        path: ${oc.env:H3_LORA_PATH}
+        strength: 1.0
+
+logging:
+    rank_zero_only: true

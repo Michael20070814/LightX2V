@@ -16,7 +16,7 @@ from lightx2v_train.model_capabilities import (
     TrainableModelCapability,
 )
 from lightx2v_train.runtime.checkpoint import find_latest_checkpoint, parse_checkpoint_iteration, prune_checkpoints
-from lightx2v_train.runtime.distributed import barrier, get_world_size, is_main_process
+from lightx2v_train.runtime.distributed import barrier, get_rank, get_tensor_parallel_world_size, get_world_size, is_main_process
 from lightx2v_train.runtime.monitor import build_monitor
 from lightx2v_train.schedulers.flow_matching import RectifiedFlowMatchingScheduler
 from lightx2v_train.utils.utils import get_running_dtype
@@ -193,7 +193,8 @@ class BaseTrainer:
         self._load_single_process_state(resume_ckpt_path)
 
     def _load_single_process_state(self, resume_ckpt_path):
-        training_state_path = os.path.join(resume_ckpt_path, "training_state.pt")
+        state_name = f"training_state_rank{get_rank()}.pt" if get_tensor_parallel_world_size() > 1 else "training_state.pt"
+        training_state_path = os.path.join(resume_ckpt_path, state_name)
         if not os.path.exists(training_state_path):
             raise RuntimeError(f"training_state.pt not found in {resume_ckpt_path}")
 
@@ -202,6 +203,11 @@ class BaseTrainer:
         self._load_model_weights(self.model, resume_ckpt_path)
         self.optimizer.load_state_dict(state["optimizer"])
         self.lr_scheduler.load_state_dict(state["lr_scheduler"])
+        if get_tensor_parallel_world_size() > 1:
+            if state.get("tensor_parallel_size") != get_tensor_parallel_world_size():
+                raise ValueError("Checkpoint tensor parallel size differs from this run.")
+            torch.set_rng_state(state["cpu_rng_state"])
+            torch.cuda.set_rng_state(state["cuda_rng_state"])
         logger.info("Restored training state from {}", training_state_path)
 
     def _load_distributed_state(self, resume_ckpt_path):
@@ -310,10 +316,20 @@ class BaseTrainer:
             "optimizer": self.optimizer.state_dict(),
             "lr_scheduler": self.lr_scheduler.state_dict(),
         }
-        if is_main_process():
+        if get_tensor_parallel_world_size() > 1:
+            training_state.update(
+                tensor_parallel_size=get_tensor_parallel_world_size(),
+                cpu_rng_state=torch.get_rng_state(),
+                cuda_rng_state=torch.cuda.get_rng_state(),
+            )
+            torch.save(training_state, os.path.join(save_dir, f"training_state_rank{get_rank()}.pt"))
+        elif is_main_process():
             torch.save(training_state, os.path.join(save_dir, "training_state.pt"))
         self._save_consolidated_weights(save_dir)
         barrier()
+        if get_tensor_parallel_world_size() > 1 and is_main_process():
+            with open(os.path.join(save_dir, "_SUCCESS"), "w", encoding="ascii") as handle:
+                handle.write("complete\n")
         logger.info("[train] saved checkpoint iter={} path={}", iteration, save_dir)
 
     def _save_consolidated_weights(self, save_dir):

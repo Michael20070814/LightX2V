@@ -1,9 +1,10 @@
 # MiniMax-H3 World-Model Cache
 
-This branch builds positive-only inputs for future Flow Matching SFT LoRA
-training. It does not implement the world-model training consumer. The existing
-T2AV training adapter cannot consume FL2VA action conditions; do not select it
-to train these caches. No external H3-World or DiffSynth checkout is needed.
+This branch builds positive-only inputs for Flow Matching SFT LoRA training.
+Use the `minimax_h3_world` training consumer described in
+[minimax_h3_world_training.md](minimax_h3_world_training.md). The existing
+`minimax_h3_t2av` adapter remains a separate text-to-audio/video training path.
+No external H3-World or DiffSynth checkout is needed.
 
 ABot-specific dataset, action, encoding and packing code lives under
 `lightx2v_train/model_zoo/minimax_h3/`. The common `data/` package retains the
@@ -102,10 +103,9 @@ only tensors and basic Python containers and support `weights_only=True`.
 The packed action binding includes `action_text_rows`, `action_text_spans_local`,
 `action_video_start`, `action_frame_rows`, and `action_real_used`. Position IDs
 preserve the reference mirrored temporal offset. `refiner_cu_seqlens` separates
-the head and each action sentence. A future consumer must apply the reference
-DiT visibility constraints, exclude padding and condition tokens from target
-loss, and respect these refiner segments. Saving this metadata does not itself
-execute an attention mask.
+the head and each action sentence. The world training consumer applies the
+DiT visibility constraints, excludes padding and condition tokens from target
+loss, and respects these refiner segments.
 
 `action_pad_used_to` is a common total packed-sequence budget, not an action
 count. It is scanned from the selected dataset and rounded up to a multiple of

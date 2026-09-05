@@ -212,6 +212,17 @@ class VideoFrameSampler:
         return list(self.sample(reader).frame_ids)
 
 
+def resize_center_crop_frame(frame, height, width):
+    frame_width, frame_height = frame.size
+    scale = max(width / frame_width, height / frame_height)
+    resized_width = round(frame_width * scale)
+    resized_height = round(frame_height * scale)
+    frame = frame.resize((resized_width, resized_height), _BILINEAR)
+    left = max(0, (resized_width - width) // 2)
+    top = max(0, (resized_height - height) // 2)
+    return frame.crop((left, top, left + width, top + height))
+
+
 def load_video_tensor(video_path, height, width, frame_sampler, *, return_start_time=False):
     reader = imageio.get_reader(video_path)
     try:
@@ -219,14 +230,7 @@ def load_video_tensor(video_path, height, width, frame_sampler, *, return_start_
         frames = []
         for frame_id in selection.frame_ids:
             frame = Image.fromarray(reader.get_data(frame_id)).convert("RGB")
-            frame_width, frame_height = frame.size
-            scale = max(width / frame_width, height / frame_height)
-            resized_width = round(frame_width * scale)
-            resized_height = round(frame_height * scale)
-            frame = frame.resize((resized_width, resized_height), _BILINEAR)
-            left = max(0, (resized_width - width) // 2)
-            top = max(0, (resized_height - height) // 2)
-            frame = frame.crop((left, top, left + width, top + height))
+            frame = resize_center_crop_frame(frame, height, width)
             array = np.asarray(frame, dtype=np.float32) / 127.5 - 1.0
             frames.append(torch.from_numpy(array).permute(2, 0, 1))
     finally:

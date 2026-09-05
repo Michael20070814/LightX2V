@@ -13,6 +13,8 @@ _DP_RANK = 0
 _DP_WORLD_SIZE = 1
 _SP_RANK = 0
 _SP_WORLD_SIZE = 1
+_TP_GROUP = None
+_TP_WORLD_SIZE = 1
 
 
 def _positive_int(value, name):
@@ -119,8 +121,21 @@ def init_distributed(config=None):
 
     global _DEVICE_MESH, _FSDP_DEVICE_MESH
     global _DP_GROUP, _SP_GROUP, _DP_RANK, _DP_WORLD_SIZE, _SP_RANK, _SP_WORLD_SIZE
+    global _TP_GROUP, _TP_WORLD_SIZE
     if _DEVICE_MESH is None:
         world_size = dist.get_world_size()
+        tp = dist_config.get("tensor_parallel", {})
+        if tp.get("enabled", False):
+            size = _positive_int(tp.get("size", 2), "distributed.tensor_parallel.size")
+            if size != world_size or _resolve_sequence_parallel_size(config) != 1:
+                raise ValueError("Tensor parallel training currently requires TP=WORLD_SIZE and SP=1.")
+            if dist_config.get("fsdp2", {}).get("enabled", False) or dist_config.get("dp", {}).get("enabled", False):
+                raise ValueError("Tensor parallel training cannot be combined with FSDP2 or DDP yet.")
+            _DEVICE_MESH = init_device_mesh("cuda", (size,), mesh_dim_names=("tp",))
+            _TP_GROUP = _DEVICE_MESH.get_group()
+            _TP_WORLD_SIZE = size
+            _DP_RANK, _DP_WORLD_SIZE = 0, 1
+            return
         sp_size, fsdp_size = _resolve_parallel_sizes(config, world_size)
         dp_size = fsdp_size
 
@@ -173,6 +188,14 @@ def get_data_parallel_world_size():
 
 def get_data_parallel_group():
     return _DP_GROUP
+
+
+def get_tensor_parallel_group():
+    return _TP_GROUP
+
+
+def get_tensor_parallel_world_size():
+    return _TP_WORLD_SIZE if is_distributed() else 1
 
 
 def get_sequence_parallel_rank():

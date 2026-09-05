@@ -1,0 +1,78 @@
+model:
+    name: minimax_h3_world
+    pretrained_model_name_or_path: ${oc.env:H3_MODEL_ROOT}
+    running_dtype: bf16
+    transformer_param_dtype: bf16
+    latent_dtype: fp32
+    local_files_only: true
+    attention_backend: flex
+    capabilities:
+        flow_matching:
+            video_flow_shift: 2.22
+            audio_flow_shift: 2.22
+            video_loss_weight: 1.0
+            audio_loss_weight: 1.0
+
+distributed:
+    backend: nccl
+    timeout_minutes: 60
+    tensor_parallel:
+        enabled: true
+        size: 2
+    sequence_parallel:
+        enabled: false
+        size: 1
+    fsdp2:
+        enabled: false
+
+data:
+    train:
+        name: cache_dataset
+        data_path: ["${oc.env:H3_CACHE_MANIFEST}"]
+        prompt_dropout_rate: 0.0
+        num_workers: 0
+        pin_memory: true
+        shuffle: true
+        drop_last: false
+
+scheduler:
+    num_train_timesteps: 1000
+    # The world capability samples the discrete H3 table, not the T2AV sampler.
+    timestep_distribution: uniform
+    time_shift_settings:
+        do_time_shift: false
+
+training:
+    method: flow_matching
+    train_type: lora
+    seed: 42
+    max_train_iters: ${oc.env:H3_TRAIN_ITERS,3000}
+    gradient_accumulation_iters: 1
+    gradient_checkpointing: true
+    max_grad_norm: 1.0
+    lr_scheduler: constant
+    lr_warmup_iters: 0
+    save_every_iters: ${oc.env:H3_SAVE_EVERY,100}
+    save_total_limit: 3
+    lora:
+        rank: ${oc.env:H3_LORA_RANK,32}
+        alpha: ${oc.env:H3_LORA_ALPHA,32}
+        target_modules: [qkv_proj, o_proj]
+    optimizer:
+        learning_rate: 0.0001
+        adam_beta1: 0.9
+        adam_beta2: 0.999
+        weight_decay: 0.01
+        adam_epsilon: 0.00000001
+    output_dir: ${oc.env:H3_TRAIN_OUTPUT}
+
+inference:
+    method: none
+    infer_every_iters: null
+
+logging:
+    rank_zero_only: true
+    train_log_every_iters: 1
+
+resume:
+    auto_resume: true
