@@ -28,6 +28,7 @@ class MiniMaxH3T2AVModel(BaseModel):
     """A standard trainable wrapper around Diffusers' MiniMax-H3 module."""
 
     pipeline_cls = None
+    condition_encoder_cls = MiniMaxH3ConditionEncoder
 
     def register_capabilities(self):
         super().register_capabilities()
@@ -88,7 +89,7 @@ class MiniMaxH3T2AVModel(BaseModel):
         if load_vae:
             self._load_vaes(config)
         if load_condition_encoder:
-            self.condition_encoder = MiniMaxH3ConditionEncoder(
+            self.condition_encoder = self.condition_encoder_cls(
                 self.pretrained_model_path,
                 device=self.device,
                 dtype=self.running_dtype,

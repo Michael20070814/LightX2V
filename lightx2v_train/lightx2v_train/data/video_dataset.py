@@ -343,6 +343,7 @@ def _build_dataloader(dataset, data_config, train_or_val):
         num_workers=data_config.get("num_workers", 8),
         pin_memory=data_config.get("pin_memory", True),
         drop_last=drop_last if sampler is None else False,
+        collate_fn=getattr(dataset, "collate_fn", None),
     )
 
 

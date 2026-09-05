@@ -1,0 +1,50 @@
+model:
+    name: minimax_h3_world
+    pretrained_model_name_or_path: ${oc.env:H3_MODEL_ROOT}
+    running_dtype: bf16
+    latent_dtype: fp32
+    local_files_only: true
+    video_vae_subfolder: vae
+    audio_vae_subfolder: audio_vae
+    text_encoder_subfolder: text_encoder
+    tokenizer_subfolder: tokenizer
+    processor_subfolder: processor
+    text_encoder_layer: 50
+    video_fps: 24
+    audio_sampling_rate: 32000
+    audio_latents_per_second: 40
+    cache_encoder_cpu_offload: true
+    # Keep Qwen on the H100; CPU offload needs enough host RAM for its weights.
+    cache_condition_encoder_cpu_offload: false
+    condition_attention_backend: torch_sdpa
+    vae_tiling: true
+    imgvid_cond_noise_aug: 0.999
+    condition_seed: 42
+    action_pad_used_to: null
+
+data:
+    processor:
+        name: minimax_h3_world
+    train:
+        name: abot_dataset
+        data_root: ${oc.env:ABOT_DATA_ROOT}
+        height: 480
+        width: 832
+        num_frames: 124
+        frame_rate: 24
+        random_start: false
+        window_seed: 20260817
+        num_clips: ${oc.env:ABOT_NUM_CLIPS,64}
+        prompt_dropout_rate: 0.0
+        num_workers: 2
+        pin_memory: true
+
+training:
+    method: flow_matching
+
+distributed:
+    backend: nccl
+    sequence_parallel:
+        enabled: false
+    fsdp2:
+        enabled: false

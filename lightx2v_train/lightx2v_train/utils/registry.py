@@ -83,6 +83,7 @@ _MODEL_MODULES = {
     "longcat_image": "lightx2v_train.model_zoo.longcat_image.longcat_image",
     "longcat_image_edit": "lightx2v_train.model_zoo.longcat_image.longcat_image_edit",
     "minimax_h3_t2av": "lightx2v_train.model_zoo.minimax_h3.minimax_h3_t2av",
+    "minimax_h3_world": "lightx2v_train.model_zoo.minimax_h3.world_cache",
     "qwen_image": "lightx2v_train.model_zoo.qwen_image.qwen_image",
     "qwen_image_edit": "lightx2v_train.model_zoo.qwen_image.qwen_image_edit",
     "wan_t2v": "lightx2v_train.model_zoo.wan.wan_t2v",
@@ -120,6 +121,7 @@ _SAMPLE_PROCESSOR_MODULES = {
     "longcat_image": "lightx2v_train.model_zoo.longcat_image.data_process",
     "longcat_image_edit": "lightx2v_train.model_zoo.longcat_image.data_process",
     "minimax_h3_t2av": "lightx2v_train.model_zoo.minimax_h3.data_process",
+    "minimax_h3_world": "lightx2v_train.model_zoo.minimax_h3.world_data_process",
     "qwen_image": "lightx2v_train.model_zoo.qwen_image.data_process",
     "qwen_image_edit": "lightx2v_train.model_zoo.qwen_image.data_process",
 }
@@ -140,6 +142,8 @@ def _ensure_data_registered(data_name):
         import lightx2v_train.data.image_dataset  # noqa: F401
     elif data_name == "cache_dataset":
         import lightx2v_train.data.cache_dataset  # noqa: F401
+    elif data_name == "abot_dataset":
+        import lightx2v_train.model_zoo.minimax_h3.abot_dataset  # noqa: F401
     elif data_name in {"prompt_dataset", "video_dataset"}:
         import lightx2v_train.data.video_dataset  # noqa: F401
 
@@ -221,7 +225,7 @@ def build_data(config, train_or_val, sample_processor=None):
             "sample_processor": sample_processor,
             "unconditional_prompt": getattr(sample_processor, "unconditional_prompt", " "),
         }
-        if data_name in {"image_dataset", "video_dataset"}
+        if data_name in {"image_dataset", "video_dataset", "abot_dataset"}
         else {}
     )
     return DATA_REGISTER[data_name](data_config_split, train_or_val=train_or_val, **kwargs)

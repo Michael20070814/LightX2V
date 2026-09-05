@@ -97,6 +97,9 @@ class CacheBuildTrainer:
         del dataloader_val
         require_singleton_dataloader(dataloader_train, "Cache dataloader")
         self.dataloader = dataloader_train
+        prepare_dataset = getattr(self.encoder, "prepare_cache_dataset", None)
+        if prepare_dataset is not None:
+            prepare_dataset(dataloader_train.dataset)
 
     def _encode(self, sample, dtype):
         cache = self.encoder.encode_training_cache(sample)
@@ -105,10 +108,11 @@ class CacheBuildTrainer:
             cache,
             sample["conditioning"]["prompt"],
             source_inputs=sample.get("inputs"),
+            source_meta=sample.get("meta"),
         )
         return _to_cpu(cache, dtype)
 
-    def _validate(self, cache, prompt, path="<encoded cache>", source_inputs=None):
+    def _validate(self, cache, prompt, path="<encoded cache>", source_inputs=None, source_meta=None):
         required = {"inputs", "conditioning", "meta"}
         if not isinstance(cache, dict) or not required.issubset(cache):
             raise ValueError(f"Invalid training cache at {path}: expected inputs, conditioning, and meta mappings.")
@@ -121,6 +125,9 @@ class CacheBuildTrainer:
             raise ValueError(f"Invalid training cache at {path}: conditioning.positive is missing.")
         if conditioning.get("prompt") != prompt:
             raise ValueError(f"Training cache at {path} has a different prompt. Rebuild it.")
+        validate_cache = getattr(self.encoder, "validate_training_cache", None)
+        if validate_cache is not None:
+            validate_cache(cache, source_meta or {})
 
     def _gather_records(self, records):
         if not is_distributed():
@@ -177,6 +184,7 @@ class CacheBuildTrainer:
                         sample["conditioning"]["prompt"],
                         cache_path,
                         source_inputs=sample.get("inputs"),
+                        source_meta=sample.get("meta"),
                     )
 
                 relative_cache_path = cache_path.relative_to(output_dir).as_posix()
@@ -219,5 +227,8 @@ class CacheBuildTrainer:
                 "storage_dtype": self.cache_config["save_dtype"],
                 "data_split": self.data_split,
             }
+            cache_metadata.update(getattr(self.encoder, "cache_metadata", {}))
+            if hasattr(dataset, "skipped"):
+                _write_jsonl(dataset.skipped, output_dir / "cache_skipped.jsonl")
             _write_json(cache_metadata, output_dir / "cache_meta.json")
             logger.info("[cache][{}] wrote {} samples to {}", self.data_split, sample_count, output_dir / "cache_data.jsonl")
